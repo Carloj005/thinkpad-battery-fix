@@ -1,0 +1,14 @@
+[Unit]
+Description=ThinkPad EC/ACPI Battery Latch & 0W Recovery Daemon
+Documentation=https://github.com/Carloj005/thinkpad-battery-fix
+After=upower.service systemd-udev-settle.service
+Wants=upower.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/thinkpad-battery-fix daemon
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

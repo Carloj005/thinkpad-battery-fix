@@ -1,0 +1,18 @@
+# Maintainer: Carlo De Gregorio <carlodegregorio05@gmail.com>
+pkgname=thinkpad-battery-fix
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Workaround daemon for ThinkPad EC/ACPI 7%/0W battery latch and frozen charge level on Linux"
+arch=('any')
+url="https://github.com/Carloj005/thinkpad-battery-fix"
+license=('MIT')
+depends=('python' 'upower' 'glib2')
+source=("git+${url}.git#tag=v${pkgver}")
+sha256sums=('SKIP')
+
+package() {
+    cd "$srcdir/$pkgname"
+    make DESTDIR="$pkgdir" PREFIX=/usr SYSTEMD_UNIT_DIR=/usr/lib/systemd/system UDEVDIR=/usr/lib/udev/rules.d install
+    install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

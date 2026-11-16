@@ -1,0 +1,636 @@
+#!/usr/bin/env python3
+"""Universal Linux EC/ACPI battery latch & 0W recovery tool for ThinkPad laptops."""
+
+import argparse
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+POWER_SUPPLY_DIR = "/sys/class/power_supply"
+UPOWER_BUS = "org.freedesktop.UPower"
+UPOWER_IFACE = "org.freedesktop.UPower.Device"
+DEFAULT_ALARM_FALLBACK = 2553000
+DRIVER_CANDIDATES = (
+    "/sys/bus/platform/drivers/acpi-battery",
+    "/sys/bus/platform/drivers/battery",
+    "/sys/bus/acpi/drivers/battery",
+)
+
+POLL_INTERVAL = 10.0
+MIN_STREAK_GAP = 4.0
+STAGE1_COOLDOWN = 120.0
+STAGE2_INTERVAL = 15.0
+STALL_THRESHOLD = 60.0
+
+_BAT_RE = re.compile(r"^BAT\d+$")
+_wake_event = threading.Event()
+_stop_event = threading.Event()
+
+
+def log(msg):
+    """Print log line with flush for journal / syslog visibility."""
+    print(f"[thinkpad-battery-fix] {msg}", flush=True)
+
+
+def read_sysfs(bat_path, attr, default=None):
+    """Read a stripped sysfs attribute from a power_supply device."""
+    path = os.path.join(bat_path, attr)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def read_sysfs_int(bat_path, attr, default=None):
+    """Read an integer sysfs attribute from a power_supply device."""
+    val = read_sysfs(bat_path, attr)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
+def write_sysfs(path, value):
+    """Write a string value to a sysfs path."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(str(value))
+
+
+def discover_batteries(selected=None):
+    """Discover system ACPI batteries (e.g. BAT0, BAT1) across Linux distros."""
+    if selected:
+        return [selected]
+
+    if not os.path.isdir(POWER_SUPPLY_DIR):
+        return ["BAT0"]
+
+    found = []
+    for entry in sorted(os.listdir(POWER_SUPPLY_DIR)):
+        if not _BAT_RE.match(entry):
+            continue
+        bat_path = os.path.join(POWER_SUPPLY_DIR, entry)
+        scope = read_sysfs(bat_path, "scope")
+        if scope and scope.lower() == "device":
+            continue
+        found.append(entry)
+
+    return found or ["BAT0"]
+
+
+def resolve_battery_driver(bat_name):
+    """Dynamically resolve (driver_dir, dev_name) for a battery across kernel versions."""
+    bat_path = os.path.join(POWER_SUPPLY_DIR, bat_name)
+    for node_rel in ("device/physical_node", "device"):
+        node_link = os.path.join(bat_path, node_rel)
+        driver_link = os.path.join(node_link, "driver")
+        if os.path.exists(driver_link):
+            driver_dir = os.path.realpath(driver_link)
+            dev_name = os.path.basename(os.path.realpath(node_link))
+            if os.path.exists(os.path.join(driver_dir, "bind")) and os.path.exists(
+                os.path.join(driver_dir, "unbind")
+            ):
+                return driver_dir, dev_name
+
+    # Fallback when BATx is temporarily unbound: match BATx index to PNP0C0A:XX.
+    m = re.search(r"(\d+)$", bat_name)
+    idx = int(m.group(1)) if m else 0
+    for cand in DRIVER_CANDIDATES:
+        if not (
+            os.path.exists(os.path.join(cand, "bind"))
+            and os.path.exists(os.path.join(cand, "unbind"))
+        ):
+            continue
+        entries = sorted(e for e in os.listdir(cand) if e.startswith("PNP0C0A:"))
+        for entry in entries:
+            ps_dir = os.path.join(cand, entry, "power_supply")
+            if os.path.isdir(ps_dir) and bat_name in os.listdir(ps_dir):
+                return cand, entry
+        if idx < len(entries):
+            return cand, entries[idx]
+        if entries:
+            return cand, entries[0]
+        return cand, f"PNP0C0A:{idx:02d}"
+
+    return None, None
+
+
+def get_battery_snapshot(bat_name):
+    """Collect current battery metrics from sysfs supporting energy (uWh/uW) and charge (uAh/uA)."""
+    bat_path = os.path.join(POWER_SUPPLY_DIR, bat_name)
+    present = os.path.exists(os.path.join(bat_path, "status"))
+    if not present:
+        return {"name": bat_name, "path": bat_path, "present": False}
+
+    if os.path.exists(os.path.join(bat_path, "energy_now")) or os.path.exists(
+        os.path.join(bat_path, "energy_full")
+    ):
+        unit = "energy"
+        level_now = read_sysfs_int(bat_path, "energy_now")
+        level_full = read_sysfs_int(bat_path, "energy_full")
+        rate_now = read_sysfs_int(bat_path, "power_now")
+    else:
+        unit = "charge"
+        level_now = read_sysfs_int(bat_path, "charge_now")
+        level_full = read_sysfs_int(bat_path, "charge_full")
+        rate_now = read_sysfs_int(bat_path, "current_now")
+
+    return {
+        "name": bat_name,
+        "path": bat_path,
+        "present": True,
+        "unit": unit,
+        "status": read_sysfs(bat_path, "status", "Unknown"),
+        "capacity": read_sysfs_int(bat_path, "capacity"),
+        "level_now": level_now,
+        "level_full": level_full,
+        "voltage_now": read_sysfs_int(bat_path, "voltage_now"),
+        "rate_now": rate_now,
+        "alarm": read_sysfs_int(bat_path, "alarm"),
+        "charge_behaviour": read_sysfs(bat_path, "charge_behaviour"),
+    }
+
+
+def compute_default_alarm(level_full):
+    """Compute standard 5% alarm threshold in sysfs native units (uWh or uAh)."""
+    if level_full and level_full > 0:
+        return max(100000, level_full // 20)
+    return DEFAULT_ALARM_FALLBACK
+
+
+def is_zero_power_latch(snap):
+    """Detect whether the battery is exhibiting the 0W active charge/discharge anomaly."""
+    if not snap.get("present"):
+        return False
+    return (
+        snap.get("status") in ("Charging", "Discharging")
+        and snap.get("rate_now") == 0
+    )
+
+
+def kick_btp(snap):
+    """Invoke ACPI _BTP (AJTP) via BATx/alarm to advance HT0L/HT0H and re-arm HAM4."""
+    bat_name = snap["name"]
+    bat_path = snap["path"]
+    status = snap.get("status")
+    default_alarm = compute_default_alarm(snap.get("level_full"))
+    alarm_path = os.path.join(bat_path, "alarm")
+
+    if not os.path.exists(alarm_path):
+        return False
+
+    try:
+        if status == "Charging":
+            write_sysfs(alarm_path, "0")
+            time.sleep(0.05)
+            write_sysfs(alarm_path, str(default_alarm))
+            log(f"[{bat_name}] _BTP kick (Charging): wrote 0 -> {default_alarm} to alarm")
+            return True
+
+        if status == "Discharging":
+            target = snap.get("level_full") or 51060000
+            write_sysfs(alarm_path, str(target))
+            time.sleep(0.15)
+            write_sysfs(alarm_path, str(default_alarm))
+            log(f"[{bat_name}] _BTP kick (Discharging): wrote {target} -> {default_alarm} to alarm")
+            return True
+
+        write_sysfs(alarm_path, str(default_alarm))
+        return True
+    except OSError as exc:
+        log(f"[{bat_name}] Warning: failed to write {alarm_path}: {exc}")
+        return False
+
+
+def rebind_battery_driver(bat_name, cached_driver=None):
+    """Unbind and rebind PNP0C0A:XX so the kernel re-evaluates _STA -> _BIX -> _BTP -> _BST."""
+    bat_path = os.path.join(POWER_SUPPLY_DIR, bat_name)
+    driver_dir, dev_name = resolve_battery_driver(bat_name)
+    if (not driver_dir or not dev_name) and cached_driver:
+        driver_dir, dev_name = cached_driver
+
+    if not driver_dir or not dev_name:
+        log(f"[{bat_name}] Error: could not resolve ACPI battery driver path for rebind")
+        return False
+
+    unbind_path = os.path.join(driver_dir, "unbind")
+    bind_path = os.path.join(driver_dir, "bind")
+    bound_dev_path = os.path.join(driver_dir, dev_name)
+
+    log(f"[{bat_name}] Rebinding {dev_name} via {driver_dir}")
+    try:
+        if os.path.exists(bound_dev_path):
+            write_sysfs(unbind_path, dev_name)
+            time.sleep(0.2)
+    except OSError as exc:
+        log(f"[{bat_name}] Warning: unbind {dev_name} failed: {exc}")
+
+    try:
+        write_sysfs(bind_path, dev_name)
+    except OSError as exc:
+        log(f"[{bat_name}] Error: bind {dev_name} failed: {exc}")
+        return False
+
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if os.path.exists(os.path.join(bat_path, "status")):
+            break
+        time.sleep(0.1)
+
+    # Touch charge_behaviour and core metrics so EC BCTG/BICG/BDSG (SMI 0x14, 0x05) are queried.
+    for attr in ("charge_behaviour", "energy_now", "charge_now", "voltage_now", "power_now", "current_now"):
+        read_sysfs(bat_path, attr)
+    return os.path.exists(os.path.join(bat_path, "status"))
+
+
+def upower_refresh(bat_name):
+    """Ask upowerd via D-Bus to refresh battery using gdbus, busctl, or dbus-send."""
+    obj_path = f"/org/freedesktop/UPower/devices/battery_{bat_name}"
+    commands = []
+
+    if shutil.which("gdbus"):
+        commands.append(
+            [
+                "gdbus",
+                "call",
+                "--system",
+                "--dest",
+                UPOWER_BUS,
+                "--object-path",
+                obj_path,
+                "--method",
+                f"{UPOWER_IFACE}.Refresh",
+            ]
+        )
+    if shutil.which("busctl"):
+        commands.append(
+            ["busctl", "call", UPOWER_BUS, obj_path, UPOWER_IFACE, "Refresh"]
+        )
+    if shutil.which("dbus-send"):
+        commands.append(
+            [
+                "dbus-send",
+                "--system",
+                "--print-reply",
+                f"--dest={UPOWER_BUS}",
+                obj_path,
+                f"{UPOWER_IFACE}.Refresh",
+            ]
+        )
+
+    if not commands:
+        return False
+
+    last_err = None
+    for cmd in commands:
+        try:
+            res = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=5, check=False
+            )
+            if res.returncode == 0:
+                return True
+            last_err = f"{cmd[0]} rc={res.returncode}: {(res.stderr or res.stdout).strip()}"
+        except (OSError, subprocess.SubprocessError) as exc:
+            last_err = f"{cmd[0]} error: {exc}"
+
+    if last_err:
+        log(f"[{bat_name}] Note: UPower Refresh skipped/failed ({last_err})")
+    return False
+
+
+def _run_service_cmd(cmd):
+    """Execute a service management command and return True on zero exit code."""
+    try:
+        res = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=15, check=False
+        )
+        return res.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def restart_upower_and_refresh(bat_name):
+    """Restart upowerd (systemd/OpenRC/runit/SysV/D-Bus) to clear 0W latch, then refresh."""
+    log(f"[{bat_name}] Restarting upowerd to reset has_energy_rate_from_hw latch")
+    restarted = False
+
+    if os.path.isdir("/run/systemd/system") and shutil.which("systemctl"):
+        restarted = _run_service_cmd(["systemctl", "restart", "upower.service"])
+    elif shutil.which("rc-service"):
+        restarted = _run_service_cmd(["rc-service", "upowerd", "restart"]) or _run_service_cmd(
+            ["rc-service", "upower", "restart"]
+        )
+    elif shutil.which("sv"):
+        for sv_dir in ("/var/service/upowerd", "/run/runit/service/upowerd", "/etc/sv/upowerd"):
+            if os.path.exists(sv_dir):
+                restarted = _run_service_cmd(["sv", "restart", sv_dir])
+                if restarted:
+                    break
+    elif shutil.which("service"):
+        restarted = _run_service_cmd(["service", "upower", "restart"]) or _run_service_cmd(
+            ["service", "upowerd", "restart"]
+        )
+
+    if not restarted and shutil.which("pkill"):
+        # On systems where D-Bus activates upowerd directly without a service unit:
+        _run_service_cmd(["pkill", "-TERM", "-x", "upowerd"])
+        restarted = True
+
+    if not restarted:
+        log(f"[{bat_name}] Warning: could not restart upowerd automatically")
+        return False
+
+    time.sleep(0.5)
+    for _ in range(6):
+        if upower_refresh(bat_name):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def cmd_status(args):
+    """Print detailed battery sysfs metrics, driver binding, and anomaly status."""
+    batteries = discover_batteries(args.battery)
+    rc = 0
+    for idx, bat_name in enumerate(batteries):
+        if idx > 0:
+            print("---")
+        snap = get_battery_snapshot(bat_name)
+        driver_dir, dev_name = resolve_battery_driver(bat_name)
+
+        if not snap.get("present"):
+            print(f"[{bat_name}] not present")
+            print(f"ACPI driver     : {driver_dir or 'not found'} ({dev_name or '?'})")
+            rc = 1
+            continue
+
+        unit = snap["unit"]
+        level_lbl = "energy" if unit == "energy" else "charge"
+        level_unit_raw = "uWh" if unit == "energy" else "uAh"
+        level_unit_disp = "Wh" if unit == "energy" else "Ah"
+        rate_lbl = "power_now" if unit == "energy" else "current_now"
+        rate_unit_raw = "uW" if unit == "energy" else "uA"
+        rate_unit_disp = "W" if unit == "energy" else "A"
+
+        l_now = snap["level_now"]
+        l_full = snap["level_full"]
+        v_now = snap["voltage_now"]
+        r_now = snap["rate_now"]
+        latch = is_zero_power_latch(snap)
+
+        l_now_str = f"{l_now} {level_unit_raw} ({l_now / 1e6:.2f} {level_unit_disp})" if l_now is not None else "n/a"
+        l_full_str = f"{l_full} {level_unit_raw} ({l_full / 1e6:.2f} {level_unit_disp})" if l_full is not None else "n/a"
+        v_str = f"{v_now} uV ({v_now / 1e6:.3f} V)" if v_now is not None else "n/a"
+        r_str = f"{r_now} {rate_unit_raw} ({r_now / 1e6:.3f} {rate_unit_disp})" if r_now is not None else "n/a"
+
+        print(f"Battery         : {bat_name}")
+        print(f"ACPI driver     : {driver_dir} ({dev_name})")
+        print(f"status          : {snap['status']}")
+        print(f"capacity        : {snap['capacity']}%")
+        print(f"{level_lbl}_now      : {l_now_str}")
+        print(f"{level_lbl}_full     : {l_full_str}")
+        print(f"voltage_now     : {v_str}")
+        print(f"{rate_lbl:<16}: {r_str}")
+        print(f"alarm           : {snap['alarm']} {level_unit_raw}" if snap["alarm"] is not None else "alarm           : n/a")
+        print(f"charge_behaviour: {snap['charge_behaviour'] or 'n/a'}")
+
+        if latch:
+            tag = "7% EDV2 + 0W latch" if snap["capacity"] == 7 else "0W latch"
+            print(f"Anomaly active  : YES ({tag})")
+        else:
+            print("Anomaly active  : NO (normal operation)")
+
+    return rc
+
+
+def cmd_recover(args):
+    """Execute one-shot hot recovery (_BTP kick, optional/needed rebind, UPower reset)."""
+    if os.geteuid() != 0:
+        log("Error: 'recover' requires root privileges (use sudo or pkexec).")
+        return 1
+
+    batteries = discover_batteries(args.battery)
+    restarted_upower = False
+
+    for bat_name in batteries:
+        snap = get_battery_snapshot(bat_name)
+        if not snap.get("present"):
+            log(f"[{bat_name}] not present; attempting ACPI driver rebind.")
+            rebind_battery_driver(bat_name)
+            snap = get_battery_snapshot(bat_name)
+
+        initial_latch = is_zero_power_latch(snap)
+
+        if snap.get("present"):
+            kick_btp(snap)
+
+        if args.rebind or initial_latch:
+            rebind_battery_driver(bat_name)
+            snap = get_battery_snapshot(bat_name)
+        else:
+            read_sysfs(snap["path"], "charge_behaviour")
+
+        if (initial_latch or is_zero_power_latch(snap) or args.rebind) and not restarted_upower:
+            restart_upower_and_refresh(bat_name)
+            restarted_upower = True
+        else:
+            upower_refresh(bat_name)
+
+    return cmd_status(args)
+
+
+def _handle_sigusr1(_signum, _frame):
+    _wake_event.set()
+
+
+def _handle_stop(_signum, _frame):
+    _stop_event.set()
+    _wake_event.set()
+
+
+def _init_battery_state(bat_name):
+    return {
+        "cached_driver": resolve_battery_driver(bat_name),
+        "zero_power_streak": 0,
+        "not_charging_streak": 0,
+        "episode_recovered": False,
+        "last_streak_time": 0.0,
+        "last_stage1_time": -STAGE1_COOLDOWN,
+        "last_stage2_time": 0.0,
+        "last_bix_refresh_time": 0.0,
+        "last_level": None,
+        "last_voltage": None,
+        "last_change_time": time.monotonic(),
+    }
+
+
+def _process_battery_tick(bat_name, state, now):
+    snap = get_battery_snapshot(bat_name)
+    if not snap.get("present"):
+        return
+
+    resolved = resolve_battery_driver(bat_name)
+    if resolved[0] and resolved[1]:
+        state["cached_driver"] = resolved
+
+    status = snap.get("status")
+    rate_now = snap.get("rate_now")
+    level_now = snap.get("level_now")
+    voltage_now = snap.get("voltage_now")
+
+    if level_now != state["last_level"] or voltage_now != state["last_voltage"]:
+        state["last_level"] = level_now
+        state["last_voltage"] = voltage_now
+        state["last_change_time"] = now
+
+    if is_zero_power_latch(snap):
+        state["not_charging_streak"] = 0
+        if not state["episode_recovered"]:
+            if now - state["last_streak_time"] >= MIN_STREAK_GAP:
+                state["zero_power_streak"] += 1
+                state["last_streak_time"] = now
+                log(
+                    f"[{bat_name}] Detected 0W while {status} (cap={snap.get('capacity')}%, "
+                    f"volt={voltage_now} uV, streak={state['zero_power_streak']}/2)"
+                )
+
+            if state["zero_power_streak"] >= 2 and (
+                now - state["last_stage1_time"] >= STAGE1_COOLDOWN
+            ):
+                log(f"[{bat_name}] Triggering Stage 1 recovery (_BTP + driver rebind + upower restart)")
+                kick_btp(snap)
+                rebind_battery_driver(bat_name, state["cached_driver"])
+                restart_upower_and_refresh(bat_name)
+                now = time.monotonic()
+                state["episode_recovered"] = True
+                state["last_stage1_time"] = now
+                state["last_stage2_time"] = now
+                state["last_bix_refresh_time"] = now
+                state["last_change_time"] = now
+                new_snap = get_battery_snapshot(bat_name)
+                state["last_level"] = new_snap.get("level_now")
+                state["last_voltage"] = new_snap.get("voltage_now")
+        else:
+            if now - state["last_stage2_time"] >= STAGE2_INTERVAL:
+                state["last_stage2_time"] = now
+                kick_btp(snap)
+                post_snap = get_battery_snapshot(bat_name)
+                cur_l = post_snap.get("level_now")
+                cur_v = post_snap.get("voltage_now")
+                if cur_l != state["last_level"] or cur_v != state["last_voltage"]:
+                    state["last_level"] = cur_l
+                    state["last_voltage"] = cur_v
+                    state["last_change_time"] = now
+                elif (now - state["last_change_time"] >= STALL_THRESHOLD) and (
+                    now - state["last_bix_refresh_time"] >= STALL_THRESHOLD
+                ):
+                    log(
+                        f"[{bat_name}] Stage 2: level & voltage stalled >= 60s; "
+                        "triggering _BIX rebind refresh"
+                    )
+                    rebind_battery_driver(bat_name, state["cached_driver"])
+                    now = time.monotonic()
+                    state["last_bix_refresh_time"] = now
+                    state["last_change_time"] = now
+                    refreshed = get_battery_snapshot(bat_name)
+                    state["last_level"] = refreshed.get("level_now")
+                    state["last_voltage"] = refreshed.get("voltage_now")
+                upower_refresh(bat_name)
+    else:
+        if (rate_now is not None and rate_now > 0) or status == "Full":
+            if state["episode_recovered"] or state["zero_power_streak"] > 0:
+                log(
+                    f"[{bat_name}] Normal battery telemetry restored (status={status}, "
+                    f"rate={rate_now}, cap={snap.get('capacity')}%)"
+                )
+            state["zero_power_streak"] = 0
+            state["not_charging_streak"] = 0
+            state["episode_recovered"] = False
+        elif status == "Not charging":
+            state["not_charging_streak"] += 1
+            if state["not_charging_streak"] >= 2:
+                state["zero_power_streak"] = 0
+                state["episode_recovered"] = False
+
+
+def cmd_daemon(args):
+    """Run lightweight event-driven + 10s polling monitor daemon."""
+    if os.geteuid() != 0:
+        log("Error: daemon requires root privileges.")
+        return 1
+
+    signal.signal(signal.SIGUSR1, _handle_sigusr1)
+    signal.signal(signal.SIGTERM, _handle_stop)
+    signal.signal(signal.SIGINT, _handle_stop)
+
+    batteries = discover_batteries(args.battery)
+    states = {b: _init_battery_state(b) for b in batteries}
+    summary = ", ".join(
+        f"{b}({s['cached_driver'][0]}:{s['cached_driver'][1]})" for b, s in states.items()
+    )
+    log(f"Daemon started monitoring: {summary}")
+
+    while not _stop_event.is_set():
+        now = time.monotonic()
+        for bat_name, state in states.items():
+            _process_battery_tick(bat_name, state, now)
+
+        wait_sec = POLL_INTERVAL
+        cur_now = time.monotonic()
+        for state in states.values():
+            if state["episode_recovered"]:
+                rem = max(1.0, STAGE2_INTERVAL - (cur_now - state["last_stage2_time"]))
+                wait_sec = min(wait_sec, rem)
+
+        _wake_event.wait(timeout=wait_sec)
+        _wake_event.clear()
+
+    log("Daemon stopping cleanly")
+    return 0
+
+
+def build_parser():
+    """Create CLI argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="thinkpad-battery-fix",
+        description="Fix ThinkPad EC/ACPI 7%/0W battery latch and frozen level on Linux",
+    )
+    parser.add_argument(
+        "-b",
+        "--battery",
+        help="Target battery device name in /sys/class/power_supply (default: auto-detect all)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_status = sub.add_parser("status", help="Show battery status and detect 0W/7%% latch")
+    p_status.set_defaults(func=cmd_status)
+
+    p_recover = sub.add_parser("recover", help="Run hot recovery on battery and UPower")
+    p_recover.add_argument(
+        "--rebind",
+        action="store_true",
+        help="Force ACPI battery driver unbind/bind and upowerd restart",
+    )
+    p_recover.set_defaults(func=cmd_recover)
+
+    p_daemon = sub.add_parser("daemon", help="Run background monitor daemon")
+    p_daemon.set_defaults(func=cmd_daemon)
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

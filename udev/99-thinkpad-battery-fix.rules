@@ -1,0 +1,1 @@
+SUBSYSTEM=="power_supply", KERNEL=="BAT[0-9]*|AC*|ACAD*|ADP*", ACTION=="change", RUN+="/bin/sh -c 'systemctl kill -s USR1 --kill-who=main thinkpad-battery-fix.service 2>/dev/null || pkill -USR1 -f \"[t]hinkpad-battery-fix daemon\" || true'"
