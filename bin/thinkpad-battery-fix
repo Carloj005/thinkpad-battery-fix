@@ -2,6 +2,7 @@
 """Universal Linux EC/ACPI battery latch & 0W recovery tool for ThinkPad laptops."""
 
 import argparse
+import glob
 import os
 import re
 import shutil
@@ -12,6 +13,10 @@ import threading
 import time
 
 POWER_SUPPLY_DIR = "/sys/class/power_supply"
+BACKLIGHT_DIR = "/sys/class/backlight"
+POWERCAP_DIR = "/sys/class/powercap"
+KMOD_NAME = "thinkpad_battery_fix_kmod"
+KMOD_PARAMS_DIR = f"/sys/module/{KMOD_NAME}/parameters"
 DEFAULT_ALARM_FALLBACK = 2553000
 DRIVER_CANDIDATES = (
     "/sys/bus/platform/drivers/acpi-battery",
@@ -20,9 +25,19 @@ DRIVER_CANDIDATES = (
 )
 
 POLL_INTERVAL = 10.0
+LATCH_POLL_INTERVAL = 2.0
 MIN_STREAK_GAP = 4.0
 STAGE1_COOLDOWN = 120.0
 STAGE2_INTERVAL = 30.0
+UPOWER_SYNC_INTERVAL = 15.0
+
+RAW_STATUS_MAP = {
+    0: "Unknown",
+    1: "Charging",
+    2: "Discharging",
+    3: "Not charging",
+    4: "Full",
+}
 
 _BAT_RE = re.compile(r"^BAT\d+$")
 _wake_event = threading.Event()
@@ -34,9 +49,13 @@ def log(msg):
     print(f"[thinkpad-battery-fix] {msg}", flush=True)
 
 
-def read_sysfs(bat_path, attr, default=None):
-    """Read a stripped sysfs attribute from a power_supply device."""
-    path = os.path.join(bat_path, attr)
+def clamp(val, low, high):
+    """Clamp numeric value to [low, high]."""
+    return max(low, min(high, val))
+
+
+def read_text(path, default=None):
+    """Read stripped text from a sysfs/proc path."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read().strip()
@@ -44,9 +63,9 @@ def read_sysfs(bat_path, attr, default=None):
         return default
 
 
-def read_sysfs_int(bat_path, attr, default=None):
-    """Read an integer sysfs attribute from a power_supply device."""
-    val = read_sysfs(bat_path, attr)
+def read_int(path, default=None):
+    """Read integer from a sysfs path."""
+    val = read_text(path)
     if val is None:
         return default
     try:
@@ -55,10 +74,86 @@ def read_sysfs_int(bat_path, attr, default=None):
         return default
 
 
+def read_sysfs(bat_path, attr, default=None):
+    """Read a stripped sysfs attribute from a power_supply device."""
+    return read_text(os.path.join(bat_path, attr), default)
+
+
+def read_sysfs_int(bat_path, attr, default=None):
+    """Read an integer sysfs attribute from a power_supply device."""
+    return read_int(os.path.join(bat_path, attr), default)
+
+
 def write_sysfs(path, value):
     """Write a string value to a sysfs path."""
     with open(path, "w", encoding="utf-8") as f:
         f.write(str(value))
+
+
+def kmod_is_loaded():
+    """Return True if thinkpad_battery_fix_kmod parameters are present in sysfs."""
+    return os.path.isdir(KMOD_PARAMS_DIR)
+
+
+def ensure_kmod_loaded():
+    """Load thinkpad_battery_fix_kmod via modprobe if available and not yet loaded."""
+    if kmod_is_loaded():
+        return True
+    if os.geteuid() != 0:
+        return False
+    modprobe = shutil.which("modprobe")
+    if not modprobe:
+        return False
+    try:
+        res = subprocess.run(
+            [modprobe, KMOD_NAME],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if res.returncode == 0 and kmod_is_loaded():
+            log(f"Loaded kernel module {KMOD_NAME}")
+            return True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return False
+
+
+def read_kmod_param_int(name, default=None):
+    """Read an integer module parameter from thinkpad_battery_fix_kmod."""
+    return read_int(os.path.join(KMOD_PARAMS_DIR, name), default)
+
+
+def write_kmod_param(name, value):
+    """Write a value to a writable thinkpad_battery_fix_kmod parameter."""
+    path = os.path.join(KMOD_PARAMS_DIR, name)
+    if not os.path.exists(path):
+        return False
+    try:
+        write_sysfs(path, str(int(value)))
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def clear_kmod_overrides():
+    """Reset all writable kernel override parameters back to passthrough mode."""
+    if not kmod_is_loaded():
+        return
+    write_kmod_param("mask_not_charging", 0)
+    write_kmod_param("override_power_uw", 0)
+    write_kmod_param("override_energy_uwh", 0)
+
+
+def read_raw_status(bat_path):
+    """Read unmodified hardware status using kmod raw_status when active."""
+    eff_status = read_sysfs(bat_path, "status", "Unknown")
+    if kmod_is_loaded():
+        raw_st = read_kmod_param_int("raw_status")
+        if raw_st in RAW_STATUS_MAP:
+            return RAW_STATUS_MAP[raw_st]
+    return eff_status
 
 
 def discover_batteries(selected=None):
@@ -120,11 +215,17 @@ def resolve_battery_driver(bat_name):
 
 
 def get_battery_snapshot(bat_name):
-    """Collect current battery metrics from sysfs supporting energy (uWh/uW) and charge (uAh/uA)."""
+    """Collect effective sysfs metrics plus raw kmod hardware values when hooked."""
     bat_path = os.path.join(POWER_SUPPLY_DIR, bat_name)
     present = os.path.exists(os.path.join(bat_path, "status"))
     if not present:
         return {"name": bat_name, "path": bat_path, "present": False}
+
+    # Reading these sysfs attributes first populates kmod raw_* parameters for this poll.
+    status = read_sysfs(bat_path, "status", "Unknown")
+    capacity = read_sysfs_int(bat_path, "capacity")
+    capacity_level = read_sysfs(bat_path, "capacity_level")
+    voltage_now = read_sysfs_int(bat_path, "voltage_now")
 
     if os.path.exists(os.path.join(bat_path, "energy_now")) or os.path.exists(
         os.path.join(bat_path, "energy_full")
@@ -139,17 +240,36 @@ def get_battery_snapshot(bat_name):
         level_full = read_sysfs_int(bat_path, "charge_full")
         rate_now = read_sysfs_int(bat_path, "current_now")
 
+    raw_status_str = status
+    raw_level_now = level_now
+    raw_rate_now = rate_now
+    if kmod_is_loaded():
+        raw_st = read_kmod_param_int("raw_status")
+        if raw_st in RAW_STATUS_MAP:
+            raw_status_str = RAW_STATUS_MAP[raw_st]
+        if unit == "energy":
+            raw_p = read_kmod_param_int("raw_power_uw")
+            if raw_p is not None:
+                raw_rate_now = raw_p
+        raw_e = read_kmod_param_int("raw_energy_uwh")
+        if raw_e is not None:
+            raw_level_now = raw_e
+
     return {
         "name": bat_name,
         "path": bat_path,
         "present": True,
         "unit": unit,
-        "status": read_sysfs(bat_path, "status", "Unknown"),
-        "capacity": read_sysfs_int(bat_path, "capacity"),
+        "status": status,
+        "raw_status": raw_status_str,
+        "capacity": capacity,
+        "capacity_level": capacity_level,
         "level_now": level_now,
+        "raw_level_now": raw_level_now,
         "level_full": level_full,
-        "voltage_now": read_sysfs_int(bat_path, "voltage_now"),
+        "voltage_now": voltage_now,
         "rate_now": rate_now,
+        "raw_rate_now": raw_rate_now,
         "alarm": read_sysfs_int(bat_path, "alarm"),
         "charge_behaviour": read_sysfs(bat_path, "charge_behaviour"),
     }
@@ -167,16 +287,103 @@ def is_zero_power_latch(snap):
     if not snap.get("present"):
         return False
     return (
-        snap.get("status") in ("Charging", "Discharging")
-        and snap.get("rate_now") == 0
+        snap.get("raw_status") in ("Charging", "Discharging")
+        and snap.get("raw_rate_now") == 0
     )
+
+
+class SamplePowerEstimator:
+    """Estimate live system power load via Intel RAPL + backlight, plus USB-C PD input."""
+
+    def __init__(self):
+        self.pkg_dir, self.pkg_max = self._find_rapl_zone("package-0", "intel-rapl:0")
+        self.dram_dir, self.dram_max = self._find_rapl_zone("dram", "intel-rapl:0:2")
+        self.prev_ts = None
+        self.prev_pkg_uj = None
+        self.prev_dram_uj = None
+        self.avg_sys_load_uw = None
+
+    @staticmethod
+    def _find_rapl_zone(target_name, fallback_rel):
+        for candidate in sorted(glob.glob(os.path.join(POWERCAP_DIR, "intel-rapl:*"))):
+            if read_text(os.path.join(candidate, "name")) == target_name:
+                max_r = read_int(os.path.join(candidate, "max_energy_range_uj"), 0)
+                return candidate, max_r
+        fb = os.path.join(POWERCAP_DIR, fallback_rel)
+        if os.path.isdir(fb):
+            return fb, read_int(os.path.join(fb, "max_energy_range_uj"), 0)
+        return None, 0
+
+    @staticmethod
+    def _energy_delta(cur, prev, max_range):
+        if cur is None or prev is None:
+            return 0
+        if cur >= prev:
+            return cur - prev
+        if max_range and max_range > prev:
+            return (max_range - prev) + cur
+        return 0
+
+    @staticmethod
+    def _read_backlight_fraction():
+        for bl_dir in sorted(glob.glob(os.path.join(BACKLIGHT_DIR, "*"))):
+            cur_b = read_int(os.path.join(bl_dir, "brightness"))
+            max_b = read_int(os.path.join(bl_dir, "max_brightness"))
+            if cur_b is not None and max_b and max_b > 0:
+                return clamp(cur_b / float(max_b), 0.0, 1.0)
+        return 0.5
+
+    @staticmethod
+    def read_usbc_input_uw():
+        """Return negotiated USB-C PD power in uW if online, else None."""
+        total_uw = 0
+        any_online = False
+        for psy_dir in sorted(glob.glob(os.path.join(POWER_SUPPLY_DIR, "ucsi-source-psy-*"))):
+            if read_text(os.path.join(psy_dir, "online")) != "1":
+                continue
+            v_uv = read_int(os.path.join(psy_dir, "voltage_now"), 0)
+            i_ua = read_int(os.path.join(psy_dir, "current_now"), 0)
+            if v_uv > 0 and i_ua > 0:
+                total_uw += (v_uv * i_ua) // 1000000
+                any_online = True
+        return total_uw if any_online and total_uw > 0 else None
+
+    def sample_sys_load_uw(self):
+        """Sample instantaneous and smoothed system load in uW using RAPL + panel baseline."""
+        now = time.monotonic()
+        pkg_uj = read_int(os.path.join(self.pkg_dir, "energy_uj")) if self.pkg_dir else None
+        dram_uj = read_int(os.path.join(self.dram_dir, "energy_uj")) if self.dram_dir else None
+        bright_frac = self._read_backlight_fraction()
+        base_uw = 3200000 + int(2200000 * bright_frac)
+
+        pkg_uw = 2000000
+        dram_uw = 500000
+        if self.prev_ts is not None and (now - self.prev_ts) >= 0.2:
+            dt = now - self.prev_ts
+            if pkg_uj is not None and self.prev_pkg_uj is not None:
+                d_pkg = self._energy_delta(pkg_uj, self.prev_pkg_uj, self.pkg_max)
+                pkg_uw = clamp(int(d_pkg / dt), 200000, 45000000)
+            if dram_uj is not None and self.prev_dram_uj is not None:
+                d_dram = self._energy_delta(dram_uj, self.prev_dram_uj, self.dram_max)
+                dram_uw = clamp(int(d_dram / dt), 100000, 15000000)
+
+        self.prev_ts = now
+        self.prev_pkg_uj = pkg_uj
+        self.prev_dram_uj = dram_uj
+
+        sys_load_uw = pkg_uw + dram_uw + base_uw
+        if self.avg_sys_load_uw is None:
+            self.avg_sys_load_uw = sys_load_uw
+        else:
+            self.avg_sys_load_uw = int(0.25 * sys_load_uw + 0.75 * self.avg_sys_load_uw)
+        return sys_load_uw, self.avg_sys_load_uw
 
 
 def kick_btp(snap):
     """Invoke ACPI _BTP (AJTP) via BATx/alarm to advance HT0L/HT0H and re-arm HAM4."""
     bat_name = snap["name"]
     bat_path = snap["path"]
-    status = snap.get("status")
+    raw_st = snap.get("raw_status") or snap.get("status")
     default_alarm = compute_default_alarm(snap.get("level_full"))
     alarm_path = os.path.join(bat_path, "alarm")
 
@@ -184,14 +391,14 @@ def kick_btp(snap):
         return False
 
     try:
-        if status == "Charging":
+        if raw_st == "Charging":
             write_sysfs(alarm_path, "0")
             time.sleep(0.05)
             write_sysfs(alarm_path, str(default_alarm))
             log(f"[{bat_name}] _BTP kick (Charging): wrote 0 -> {default_alarm} to alarm")
             return True
 
-        if status == "Discharging":
+        if raw_st == "Discharging":
             target = snap.get("level_full") or 51060000
             write_sysfs(alarm_path, str(target))
             time.sleep(0.15)
@@ -207,60 +414,64 @@ def kick_btp(snap):
 
 
 def pulse_ec_smbus_refresh(snap):
-    """Briefly toggle charge_behaviour (auto -> inhibit-charge -> auto) to flush EC SMBus cache."""
+    """Toggle charge_behaviour (inhibit-charge -> auto) while masking transient Not charging."""
     bat_name = snap["name"]
     bat_path = snap["path"]
     behav_path = os.path.join(bat_path, "charge_behaviour")
     behav = snap.get("charge_behaviour")
 
-    if snap.get("status") != "Charging":
+    if (snap.get("raw_status") or snap.get("status")) != "Charging":
         return False
     if not behav or "[auto]" not in behav or "inhibit-charge" not in behav:
         return False
     if not os.path.exists(behav_path):
         return False
 
-    before_l = snap.get("level_now")
+    before_l = snap.get("raw_level_now") or snap.get("level_now")
     before_v = snap.get("voltage_now")
 
+    write_kmod_param("mask_not_charging", 1)
     try:
-        write_sysfs(behav_path, "inhibit-charge")
-    except OSError as exc:
-        log(f"[{bat_name}] Warning: failed writing inhibit-charge: {exc}")
-        return False
+        try:
+            write_sysfs(behav_path, "inhibit-charge")
+        except OSError as exc:
+            log(f"[{bat_name}] Warning: failed writing inhibit-charge: {exc}")
+            return False
 
-    # Wait briefly (~0.6s..1.2s) for EC HB0S bit 0x20 to clear and SMBus registers to refresh.
-    deadline = time.monotonic() + 1.2
-    time.sleep(0.6)
-    while time.monotonic() < deadline:
-        if read_sysfs(bat_path, "status") != "Charging":
-            break
-        time.sleep(0.15)
+        # Wait ~0.6s..1.2s for EC HB0S bit 0x20 to clear and SMBus registers to flush.
+        deadline = time.monotonic() + 1.2
+        time.sleep(0.6)
+        while time.monotonic() < deadline:
+            if read_raw_status(bat_path) != "Charging":
+                break
+            time.sleep(0.15)
 
-    try:
-        write_sysfs(behav_path, "auto")
-    except OSError as exc:
-        log(f"[{bat_name}] Error: failed restoring auto charge_behaviour: {exc}")
-        return False
+        try:
+            write_sysfs(behav_path, "auto")
+        except OSError as exc:
+            log(f"[{bat_name}] Error: failed restoring auto charge_behaviour: {exc}")
+            return False
 
-    # Wait up to 6.0s for EC HB0S / status to settle back from Not charging to Charging.
-    settle_deadline = time.monotonic() + 6.0
-    cur_status = None
-    while time.monotonic() < settle_deadline:
-        cur_status = read_sysfs(bat_path, "status")
-        if cur_status in ("Charging", "Discharging", "Full"):
-            break
-        time.sleep(0.25)
+        # Wait up to 6.0s for raw EC HB0S/status to return from Not charging.
+        settle_deadline = time.monotonic() + 6.0
+        cur_raw = None
+        while time.monotonic() < settle_deadline:
+            cur_raw = read_raw_status(bat_path)
+            if cur_raw in ("Charging", "Discharging", "Full"):
+                break
+            time.sleep(0.25)
 
-    if cur_status in ("Charging", "Discharging", "Full"):
-        time.sleep(0.25)
+        if cur_raw in ("Charging", "Discharging", "Full"):
+            time.sleep(0.25)
+    finally:
+        write_kmod_param("mask_not_charging", 0)
 
     after = get_battery_snapshot(bat_name)
     log(
         f"[{bat_name}] EC SMBus pulse (inhibit-charge -> auto): "
-        f"level {before_l} -> {after.get('level_now')}, "
+        f"level {before_l} -> {after.get('raw_level_now')}, "
         f"cap={after.get('capacity')}%, volt {before_v} -> {after.get('voltage_now')} uV, "
-        f"status={after.get('status')}"
+        f"raw_status={after.get('raw_status')}"
     )
     return True
 
@@ -330,7 +541,7 @@ def _run_service_cmd(cmd):
 
 
 def restart_upower_and_refresh(bat_name):
-    """Restart upowerd (systemd/OpenRC/runit/SysV/D-Bus) to clear 0W latch, then emit uevent."""
+    """Restart upowerd (systemd/OpenRC/runit/SysV) to clear 0W latch, then emit uevent."""
     log(f"[{bat_name}] Restarting upowerd to reset has_energy_rate_from_hw latch")
     restarted = False
 
@@ -364,8 +575,9 @@ def restart_upower_and_refresh(bat_name):
 
 
 def cmd_status(args):
-    """Print detailed battery sysfs metrics, driver binding, and anomaly status."""
+    """Print detailed battery sysfs metrics, kmod state, and anomaly status."""
     batteries = discover_batteries(args.battery)
+    kmod_ok = kmod_is_loaded()
     rc = 0
     for idx, bat_name in enumerate(batteries):
         if idx > 0:
@@ -376,6 +588,7 @@ def cmd_status(args):
         if not snap.get("present"):
             print(f"[{bat_name}] not present")
             print(f"ACPI driver     : {driver_dir or 'not found'} ({dev_name or '?'})")
+            print(f"Kernel hook     : {'loaded' if kmod_ok else 'not loaded'}")
             rc = 1
             continue
 
@@ -391,27 +604,33 @@ def cmd_status(args):
         l_full = snap["level_full"]
         v_now = snap["voltage_now"]
         r_now = snap["rate_now"]
+        raw_r = snap["raw_rate_now"]
         latch = is_zero_power_latch(snap)
 
         l_now_str = f"{l_now} {level_unit_raw} ({l_now / 1e6:.2f} {level_unit_disp})" if l_now is not None else "n/a"
         l_full_str = f"{l_full} {level_unit_raw} ({l_full / 1e6:.2f} {level_unit_disp})" if l_full is not None else "n/a"
         v_str = f"{v_now} uV ({v_now / 1e6:.3f} V)" if v_now is not None else "n/a"
         r_str = f"{r_now} {rate_unit_raw} ({r_now / 1e6:.3f} {rate_unit_disp})" if r_now is not None else "n/a"
+        raw_r_str = f"{raw_r} uW ({raw_r / 1e6:.3f} W)" if raw_r is not None else "n/a"
 
         print(f"Battery         : {bat_name}")
         print(f"ACPI driver     : {driver_dir} ({dev_name})")
-        print(f"status          : {snap['status']}")
-        print(f"capacity        : {snap['capacity']}%")
+        print(f"Kernel hook     : {'loaded' if kmod_ok else 'not loaded'}")
+        print(f"status          : {snap['status']} (raw: {snap['raw_status']})")
+        print(f"capacity        : {snap['capacity']}% (level: {snap['capacity_level']})")
         print(f"{level_lbl}_now      : {l_now_str}")
         print(f"{level_lbl}_full     : {l_full_str}")
         print(f"voltage_now     : {v_str}")
         print(f"{rate_lbl:<16}: {r_str}")
+        if kmod_ok:
+            print(f"raw_power_uw    : {raw_r_str}")
         print(f"alarm           : {snap['alarm']} {level_unit_raw}" if snap["alarm"] is not None else "alarm           : n/a")
         print(f"charge_behaviour: {snap['charge_behaviour'] or 'n/a'}")
 
         if latch:
             tag = "7% EDV2 + 0W latch" if snap["capacity"] == 7 else "0W latch"
-            print(f"Anomaly active  : YES ({tag})")
+            hook_note = " [kmod active]" if kmod_ok else " [kmod inactive]"
+            print(f"Anomaly active  : YES ({tag}){hook_note}")
         else:
             print("Anomaly active  : NO (normal operation)")
 
@@ -424,6 +643,7 @@ def cmd_recover(args):
         log("Error: 'recover' requires root privileges (use sudo or pkexec).")
         return 1
 
+    ensure_kmod_loaded()
     batteries = discover_batteries(args.battery)
     restarted_upower = False
 
@@ -466,6 +686,8 @@ def _handle_stop(_signum, _frame):
 def _init_battery_state(bat_name):
     return {
         "cached_driver": resolve_battery_driver(bat_name),
+        "estimator": SamplePowerEstimator(),
+        "latch_active": False,
         "zero_power_streak": 0,
         "not_charging_streak": 0,
         "episode_recovered": False,
@@ -475,7 +697,110 @@ def _init_battery_state(bat_name):
         "last_pulse_time": 0.0,
         "last_stage1_time": -STAGE1_COOLDOWN,
         "last_stage2_time": 0.0,
+        "last_raw_status": None,
+        "last_raw_level": None,
+        "last_raw_level_time": 0.0,
+        "base_charge_uw": 15500000,
+        "virtual_energy_uwh": None,
+        "last_discharge_ts": 0.0,
+        "last_upower_sync_time": 0.0,
+        "last_upower_power_uw": 0,
     }
+
+
+def _compute_charge_uw_from_delta(snap, d_level, dt):
+    """Convert raw sysfs energy/charge delta over dt seconds into uW."""
+    if snap.get("unit") == "charge":
+        v_uv = snap.get("voltage_now") or 11100000
+        d_uwh = (d_level * v_uv) / 1000000.0
+    else:
+        d_uwh = float(d_level)
+    return clamp(int((d_uwh * 3600.0) / dt), 2000000, 65000000)
+
+
+def _update_kmod_charging(bat_name, state, snap, now):
+    """Track dE/dt + RAPL modulation and update kmod override parameters while Charging."""
+    est = state["estimator"]
+    sys_load_uw, avg_load_uw = est.sample_sys_load_uw()
+    raw_level = snap.get("raw_level_now")
+
+    if raw_level is not None:
+        prev_level = state["last_raw_level"]
+        if prev_level is None:
+            state["last_raw_level"] = raw_level
+            state["last_raw_level_time"] = now
+        elif raw_level > prev_level:
+            dt = now - state["last_raw_level_time"]
+            if dt >= 5.0:
+                measured_uw = _compute_charge_uw_from_delta(snap, raw_level - prev_level, dt)
+                state["base_charge_uw"] = int(0.6 * measured_uw + 0.4 * state["base_charge_uw"])
+            state["last_raw_level"] = raw_level
+            state["last_raw_level_time"] = now
+        elif raw_level < prev_level:
+            state["last_raw_level"] = raw_level
+            state["last_raw_level_time"] = now
+
+    mod_uw = clamp(
+        int(state["base_charge_uw"] - (sys_load_uw - avg_load_uw)),
+        2000000,
+        65000000,
+    )
+    write_kmod_param("override_power_uw", mod_uw)
+    write_kmod_param("override_energy_uwh", 0)
+    state["virtual_energy_uwh"] = None
+    state["last_discharge_ts"] = 0.0
+    return mod_uw
+
+
+def _update_kmod_discharging(bat_name, state, snap, now):
+    """Track RAPL load + virtual coulomb counter when EC latches 0W while Discharging."""
+    est = state["estimator"]
+    sys_load_uw, _ = est.sample_sys_load_uw()
+    discharge_uw = clamp(int(sys_load_uw), 2500000, 65000000)
+
+    write_kmod_param("mask_not_charging", 0)
+    write_kmod_param("override_power_uw", discharge_uw)
+
+    raw_level = snap.get("raw_level_now")
+    level_full = snap.get("level_full") or 50230000
+    min_floor = int(level_full * 0.07)
+
+    if state["virtual_energy_uwh"] is None or state["last_discharge_ts"] == 0.0:
+        state["virtual_energy_uwh"] = raw_level if raw_level is not None else min_floor
+        state["last_raw_level"] = raw_level
+    else:
+        if raw_level is not None and raw_level != state["last_raw_level"]:
+            state["virtual_energy_uwh"] = raw_level
+            state["last_raw_level"] = raw_level
+        else:
+            dt = max(0.0, min(30.0, now - state["last_discharge_ts"]))
+            if snap.get("unit") == "charge":
+                v_uv = snap.get("voltage_now") or 11100000
+                delta = int((discharge_uw * dt / 3600.0) * (1000000.0 / v_uv))
+            else:
+                delta = int(discharge_uw * dt / 3600.0)
+            state["virtual_energy_uwh"] = max(min_floor, state["virtual_energy_uwh"] - delta)
+
+    state["last_discharge_ts"] = now
+    write_kmod_param("override_energy_uwh", state["virtual_energy_uwh"])
+    return discharge_uw
+
+
+def _sync_upower_if_needed(bat_name, state, cur_power_uw, now, force=False):
+    """Emit batched sysfs uevent changes so UPower updates without spamming its 10s gate."""
+    if not kmod_is_loaded():
+        return False
+    elapsed = now - state["last_upower_sync_time"]
+    if not force:
+        if elapsed < UPOWER_SYNC_INTERVAL and (
+            elapsed < 10.5 or abs(cur_power_uw - state["last_upower_power_uw"]) < 1500000
+        ):
+            return False
+    if upower_refresh(bat_name):
+        state["last_upower_sync_time"] = now
+        state["last_upower_power_uw"] = cur_power_uw
+        return True
+    return False
 
 
 def _process_battery_tick(bat_name, state, now):
@@ -487,25 +812,35 @@ def _process_battery_tick(bat_name, state, now):
     if resolved[0] and resolved[1]:
         state["cached_driver"] = resolved
 
-    status = snap.get("status")
-    rate_now = snap.get("rate_now")
+    raw_status = snap.get("raw_status")
+    raw_rate = snap.get("raw_rate_now")
     voltage_now = snap.get("voltage_now")
-    wrote_sysfs = False
+    prev_raw_status = state["last_raw_status"]
+    status_changed = prev_raw_status is not None and prev_raw_status != raw_status
+    state["last_raw_status"] = raw_status
 
-    if state["pending_upower_sync"] and status in ("Charging", "Discharging", "Full"):
-        upower_refresh(bat_name)
+    emitted_udev = False
+
+    if state["pending_upower_sync"] and raw_status in ("Charging", "Discharging", "Full"):
+        emitted_udev = upower_refresh(bat_name) or emitted_udev
         state["pending_upower_sync"] = False
-        wrote_sysfs = True
 
     if is_zero_power_latch(snap):
+        state["latch_active"] = True
         state["not_charging_streak"] = 0
+
+        if raw_status == "Charging":
+            cur_pw = _update_kmod_charging(bat_name, state, snap, now)
+        else:
+            cur_pw = _update_kmod_discharging(bat_name, state, snap, now)
+
         if not state["episode_recovered"]:
             if now - state["last_streak_time"] >= MIN_STREAK_GAP:
                 state["zero_power_streak"] += 1
                 state["last_streak_time"] = now
                 if state["zero_power_streak"] <= 2:
                     log(
-                        f"[{bat_name}] Detected 0W while {status} (cap={snap.get('capacity')}%, "
+                        f"[{bat_name}] Detected 0W while {raw_status} (cap={snap.get('capacity')}%, "
                         f"volt={voltage_now} uV, streak={state['zero_power_streak']}/2)"
                     )
 
@@ -519,41 +854,60 @@ def _process_battery_tick(bat_name, state, now):
                     state["episode_recovered"] = True
                     state["last_stage1_time"] = now
                     state["last_stage2_time"] = now
+                    state["last_upower_sync_time"] = now
+                    state["last_upower_power_uw"] = cur_pw
                     if pulsed:
                         state["last_pulse_time"] = now
                     post = get_battery_snapshot(bat_name)
-                    state["pending_upower_sync"] = post.get("status") == "Not charging"
-                    wrote_sysfs = True
-                else:
-                    state["episode_recovered"] = True
-                    state["last_stage2_time"] = now - STAGE2_INTERVAL
+                    state["pending_upower_sync"] = post.get("raw_status") == "Not charging"
+                    return True
 
-        if state["episode_recovered"] and (now - state["last_stage2_time"] >= STAGE2_INTERVAL):
-            kick_btp(snap)
-            pulsed = pulse_ec_smbus_refresh(snap)
-            now = time.monotonic()
-            state["last_stage2_time"] = now
-            if pulsed:
-                state["last_pulse_time"] = now
-            post = get_battery_snapshot(bat_name)
-            if post.get("status") == "Not charging":
-                state["pending_upower_sync"] = True
-            else:
-                upower_refresh(bat_name)
-                state["pending_upower_sync"] = False
-            wrote_sysfs = True
+                state["episode_recovered"] = True
+                state["last_stage2_time"] = now - STAGE2_INTERVAL
+
+        if state["episode_recovered"]:
+            did_pulse = False
+            if raw_status == "Charging" and (now - state["last_stage2_time"] >= STAGE2_INTERVAL):
+                kick_btp(snap)
+                pulsed = pulse_ec_smbus_refresh(snap)
+                now = time.monotonic()
+                state["last_stage2_time"] = now
+                if pulsed:
+                    state["last_pulse_time"] = now
+                post = get_battery_snapshot(bat_name)
+                cur_pw = _update_kmod_charging(bat_name, state, post, now)
+                if post.get("raw_status") == "Not charging":
+                    state["pending_upower_sync"] = True
+                else:
+                    emitted_udev = _sync_upower_if_needed(bat_name, state, cur_pw, now, force=True) or emitted_udev
+                    state["pending_upower_sync"] = False
+                did_pulse = True
+            elif status_changed:
+                if raw_status == "Discharging":
+                    kick_btp(snap)
+                emitted_udev = _sync_upower_if_needed(bat_name, state, cur_pw, now, force=True) or emitted_udev
+
+            if not did_pulse:
+                emitted_udev = _sync_upower_if_needed(bat_name, state, cur_pw, now, force=False) or emitted_udev
     else:
-        if (rate_now is not None and rate_now > 0) or status == "Full":
-            if state["episode_recovered"] or state["zero_power_streak"] > 0:
+        if (raw_rate is not None and raw_rate > 0) or raw_status == "Full":
+            if state["latch_active"] or state["episode_recovered"] or state["zero_power_streak"] > 0:
                 log(
-                    f"[{bat_name}] Normal battery telemetry restored (status={status}, "
-                    f"rate={rate_now}, cap={snap.get('capacity')}%)"
+                    f"[{bat_name}] Normal battery telemetry restored (status={raw_status}, "
+                    f"rate={raw_rate}, cap={snap.get('capacity')}%)"
                 )
+            clear_kmod_overrides()
+            state["latch_active"] = False
             state["zero_power_streak"] = 0
             state["not_charging_streak"] = 0
             state["episode_recovered"] = False
             state["pending_upower_sync"] = False
-        elif status == "Not charging":
+            state["virtual_energy_uwh"] = None
+            state["last_raw_level"] = None
+            state["last_discharge_ts"] = 0.0
+        elif raw_status == "Not charging":
+            clear_kmod_overrides()
+            state["latch_active"] = False
             if (now - state["last_pulse_time"] >= 10.0) and (
                 now - state["last_not_charging_time"] >= MIN_STREAK_GAP
             ):
@@ -563,11 +917,11 @@ def _process_battery_tick(bat_name, state, now):
                     state["zero_power_streak"] = 0
                     state["episode_recovered"] = False
 
-    return wrote_sysfs
+    return emitted_udev
 
 
 def cmd_daemon(args):
-    """Run lightweight event-driven + 10s polling monitor daemon."""
+    """Run event-driven + fast-polling monitor daemon with kernel sysfs telemetry hook."""
     if os.geteuid() != 0:
         log("Error: daemon requires root privileges.")
         return 1
@@ -576,33 +930,42 @@ def cmd_daemon(args):
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
 
+    ensure_kmod_loaded()
     batteries = discover_batteries(args.battery)
     states = {b: _init_battery_state(b) for b in batteries}
     summary = ", ".join(
         f"{b}({s['cached_driver'][0]}:{s['cached_driver'][1]})" for b, s in states.items()
     )
-    log(f"Daemon started monitoring: {summary}")
+    log(
+        f"Daemon started monitoring: {summary} "
+        f"[kmod={'loaded' if kmod_is_loaded() else 'not loaded'}]"
+    )
 
-    while not _stop_event.is_set():
-        now = time.monotonic()
-        any_write = False
-        for bat_name, state in states.items():
-            if _process_battery_tick(bat_name, state, now):
-                any_write = True
+    try:
+        while not _stop_event.is_set():
+            now = time.monotonic()
+            any_udev = False
+            for bat_name, state in states.items():
+                if _process_battery_tick(bat_name, state, now):
+                    any_udev = True
 
-        if any_write:
-            time.sleep(0.25)
+            if any_udev:
+                time.sleep(0.25)
+                _wake_event.clear()
+
+            wait_sec = POLL_INTERVAL
+            cur_now = time.monotonic()
+            for state in states.values():
+                if state["latch_active"] or state["episode_recovered"]:
+                    wait_sec = min(wait_sec, LATCH_POLL_INTERVAL)
+                    if state["episode_recovered"]:
+                        rem = max(0.5, STAGE2_INTERVAL - (cur_now - state["last_stage2_time"]))
+                        wait_sec = min(wait_sec, rem)
+
+            _wake_event.wait(timeout=wait_sec)
             _wake_event.clear()
-
-        wait_sec = POLL_INTERVAL
-        cur_now = time.monotonic()
-        for state in states.values():
-            if state["episode_recovered"]:
-                rem = max(1.0, STAGE2_INTERVAL - (cur_now - state["last_stage2_time"]))
-                wait_sec = min(wait_sec, rem)
-
-        _wake_event.wait(timeout=wait_sec)
-        _wake_event.clear()
+    finally:
+        clear_kmod_overrides()
 
     log("Daemon stopping cleanly")
     return 0

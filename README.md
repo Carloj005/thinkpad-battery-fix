@@ -40,15 +40,20 @@ Inspection of historical `UPower` telemetry, the ThinkPad ACPI DSDT, the Linux k
 
 ## How `thinkpad-battery-fix` Solves It
 
-`thinkpad-battery-fix` runs a lightweight background daemon (10 s poll + instant `udev` `SIGUSR1` wakeup on `BAT*`/`AC*` changes):
+`thinkpad-battery-fix` pairs a lightweight kernel `power_supply` hook module (`thinkpad_battery_fix_kmod`) with a background daemon (10 s idle poll / 2 s active latch poll + `udev` `SIGUSR1` wakeup):
 
 - **Auto-detects batteries & units**: Works with single-battery ThinkPads (`BAT0`) and dual-battery PowerBridge models (`BAT0` + `BAT1`), supporting both `energy_*`/`power_now` (µWh/µW) and `charge_*`/`current_now` (µAh/µA) sysfs interfaces.
+- **Kernel sysfs hook (`thinkpad_battery_fix_kmod`)**: Registers via `battery_hook_register()` to intercept `power_supply_desc->get_property` while keeping hardware readings visible in `/sys/module/thinkpad_battery_fix_kmod/parameters/raw_*`:
+  - Replaces zeroed `power_now` / `current_now` whenever the EC latches `SBAC = 0` after a 7% EDV2 trip, so `btop`, `upowerd`, desktop power panels, and `powertop` immediately read live wattage (`W`) and `time to full`.
+  - Masks transient `Not charging` (`pending-charge`) during EC SMBus refresh pulses (`mask_not_charging`) so desktop UI widgets keep showing `Charging` instead of flashing a charge threshold state.
+  - Smooths `energy_now` / `capacity` during `Discharging` if the EC freezes `SBRC` while on battery, and normalizes stuck `capacity_level = Critical` once percentage rises above critical levels.
 - **Stage 1 recovery** (triggered once per 0 W episode with cooldown):
   1. Kicks ACPI `_BTP` (`AJTP`) via `/sys/class/power_supply/BAT*/alarm`.
-  2. While `Charging` (if `charge_behaviour` exposes `inhibit-charge` and `auto`), performs a brief (~1 s) EC SMBus pulse (`inhibit-charge` → `auto`) to toggle `HB0S` charging state and force the ThinkPad EC to flush cached `SBRC`/`SBVO` registers **without** unbinding `BAT*` from sysfs (preventing panel/widget flicker and preserving UPower history).
-  3. Restarts `upowerd` (supporting `systemd`, `OpenRC`, `runit`, `SysVinit`, and D-Bus activation) to clear `has_energy_rate_from_hw`, then writes `change` to `/sys/class/power_supply/BAT*/uevent` so `upowerd` immediately refreshes from sysfs.
-- **Stage 2 continuous refresh** (while `power_now` / `current_now` remains `0`):
-  - Every **30 s**, re-arms `_BTP` (`alarm`), runs the non-destructive `charge_behaviour` EC SMBus refresh pulse when `Charging`, and triggers a `BAT*/uevent` `change` refresh—keeping battery percentage and `upowerd`'s estimated wattage updating smoothly without unplugging AC, flickering desktop battery widgets, or rebooting.
+  2. While `Charging` (if `charge_behaviour` exposes `inhibit-charge` and `auto`), performs a brief (~1 s) EC SMBus pulse (`inhibit-charge` → `auto`) while masking `Not charging`, forcing the ThinkPad EC to flush cached `SBRC`/`SBVO` registers **without** unbinding `BAT*` from sysfs.
+  3. Restarts `upowerd` (supporting `systemd`, `OpenRC`, `runit`, `SysVinit`, and D-Bus activation) to clear any stale 0 W state, then emits a `change` uevent on `/sys/class/power_supply/BAT*/uevent`.
+- **Stage 2 continuous telemetry & refresh** (while hardware `raw_power_uw == 0`):
+  - **2 s telemetry loop**: Measures system load via Intel RAPL (`package-0`, `dram`) + panel backlight and smooths real battery `dE/dt` rate (while charging) or virtual coulomb discharge (while discharging), pushing live values into `override_power_uw` / `override_energy_uwh`.
+  - **Every 30 s** while `Charging`: Re-arms `_BTP` (`alarm`), runs the masked `charge_behaviour` EC SMBus refresh pulse, and triggers batched `BAT*/uevent` `change` syncs every 10–15 s for `upowerd`.
   - Note: kernel driver `unbind`/`bind` is never triggered automatically while `BAT*` is present; it remains available manually via `recover --rebind`.
 
 ---
@@ -57,29 +62,29 @@ Inspection of historical `UPower` telemetry, the ThinkPad ACPI DSDT, the Linux k
 
 ### Prerequisites
 
-Requires `python3` (standard library only), `upower`, and `udev` (already installed on virtually all Linux desktops).
+Requires `python3` (standard library only), `upower`, `udev`, and kernel headers + `make` / `gcc` (optional but strongly recommended so `thinkpad_battery_fix_kmod` compiles cleanly).
 
 <details>
 <summary>Optional package install check by distro</summary>
 
 - **Ubuntu / Debian / Mint / Pop!_OS**:
   ```bash
-  sudo apt update && sudo apt install -y python3 upower git
+  sudo apt update && sudo apt install -y python3 upower git build-essential linux-headers-$(uname -r)
   ```
 - **Fedora / RHEL / Nobara**:
   ```bash
-  sudo dnf install -y python3 upower git
+  sudo dnf install -y python3 upower git gcc make kernel-devel-$(uname -r)
   ```
 - **Arch Linux / Manjaro / EndeavourOS / Omarchy**:
   ```bash
-  sudo pacman -S --needed python upower git
+  sudo pacman -S --needed python upower git base-devel linux-headers
   ```
 - **openSUSE Tumbleweed / Leap**:
   ```bash
-  sudo zypper install -y python3 upower git
+  sudo zypper install -y python3 upower git gcc make kernel-default-devel
   ```
 - **Alpine / Void / Gentoo (non-systemd)**:
-  Install `python3` and `upower`, then start `/usr/local/bin/thinkpad-battery-fix daemon` from your init supervisor (OpenRC / runit / SysVinit).
+  Install `python3`, `upower`, `build-base`/`gcc`/`make`, and kernel headers, run `sudo ./install.sh`, then start `/usr/local/bin/thinkpad-battery-fix daemon` from your init supervisor (OpenRC / runit / SysVinit).
 
 </details>
 

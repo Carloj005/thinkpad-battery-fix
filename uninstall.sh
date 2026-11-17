@@ -12,18 +12,27 @@ PREFIX="${PREFIX:-/usr/local}"
 BINDIR="${BINDIR:-$PREFIX/bin}"
 UDEVDIR="${UDEVDIR:-/etc/udev/rules.d}"
 SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+KVER="${KVER:-$(uname -r)}"
 
 if [ -z "$DESTDIR" ] && [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     systemctl disable --now thinkpad-battery-fix.service 2>/dev/null || true
+fi
+
+if [ -z "$DESTDIR" ] && grep -q '^thinkpad_battery_fix_kmod ' /proc/modules 2>/dev/null; then
+    rmmod thinkpad_battery_fix_kmod 2>/dev/null || true
 fi
 
 rm -f "$DESTDIR$BINDIR/thinkpad-battery-fix" \
       "$DESTDIR/usr/local/bin/thinkpad-battery-fix" \
       "$DESTDIR/usr/bin/thinkpad-battery-fix" \
       "$DESTDIR$SYSTEMD_UNIT_DIR/thinkpad-battery-fix.service" \
-      "$DESTDIR$UDEVDIR/99-thinkpad-battery-fix.rules"
+      "$DESTDIR$UDEVDIR/99-thinkpad-battery-fix.rules" \
+      "$DESTDIR/etc/modules-load.d/thinkpad-battery-fix.conf" \
+      "$DESTDIR/lib/modules/"*/extra/thinkpad_battery_fix_kmod.ko \
+      "$DESTDIR/usr/lib/modules/"*/extra/thinkpad_battery_fix_kmod.ko 2>/dev/null || true
 
 if [ -z "$DESTDIR" ]; then
+    depmod -a "$KVER" 2>/dev/null || true
     if command -v udevadm >/dev/null 2>&1; then
         udevadm control --reload-rules || true
     fi

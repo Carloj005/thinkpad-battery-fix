@@ -3,3 +3,12 @@ __pycache__/
 *.pkg.tar.*
 packaging/arch/pkg/
 packaging/arch/src/
+kmod/*.o
+kmod/*.ko
+kmod/*.mod
+kmod/*.mod.c
+kmod/*.mod.o
+kmod/modules.order
+kmod/Module.symvers
+kmod/.*.cmd
+kmod/.tmp_versions/
