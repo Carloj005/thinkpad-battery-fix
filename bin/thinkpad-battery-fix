@@ -12,8 +12,6 @@ import threading
 import time
 
 POWER_SUPPLY_DIR = "/sys/class/power_supply"
-UPOWER_BUS = "org.freedesktop.UPower"
-UPOWER_IFACE = "org.freedesktop.UPower.Device"
 DEFAULT_ALARM_FALLBACK = 2553000
 DRIVER_CANDIDATES = (
     "/sys/bus/platform/drivers/acpi-battery",
@@ -24,8 +22,7 @@ DRIVER_CANDIDATES = (
 POLL_INTERVAL = 10.0
 MIN_STREAK_GAP = 4.0
 STAGE1_COOLDOWN = 120.0
-STAGE2_INTERVAL = 15.0
-STALL_THRESHOLD = 60.0
+STAGE2_INTERVAL = 30.0
 
 _BAT_RE = re.compile(r"^BAT\d+$")
 _wake_event = threading.Event()
@@ -209,8 +206,67 @@ def kick_btp(snap):
         return False
 
 
+def pulse_ec_smbus_refresh(snap):
+    """Briefly toggle charge_behaviour (auto -> inhibit-charge -> auto) to flush EC SMBus cache."""
+    bat_name = snap["name"]
+    bat_path = snap["path"]
+    behav_path = os.path.join(bat_path, "charge_behaviour")
+    behav = snap.get("charge_behaviour")
+
+    if snap.get("status") != "Charging":
+        return False
+    if not behav or "[auto]" not in behav or "inhibit-charge" not in behav:
+        return False
+    if not os.path.exists(behav_path):
+        return False
+
+    before_l = snap.get("level_now")
+    before_v = snap.get("voltage_now")
+
+    try:
+        write_sysfs(behav_path, "inhibit-charge")
+    except OSError as exc:
+        log(f"[{bat_name}] Warning: failed writing inhibit-charge: {exc}")
+        return False
+
+    # Wait briefly (~0.6s..1.2s) for EC HB0S bit 0x20 to clear and SMBus registers to refresh.
+    deadline = time.monotonic() + 1.2
+    time.sleep(0.6)
+    while time.monotonic() < deadline:
+        if read_sysfs(bat_path, "status") != "Charging":
+            break
+        time.sleep(0.15)
+
+    try:
+        write_sysfs(behav_path, "auto")
+    except OSError as exc:
+        log(f"[{bat_name}] Error: failed restoring auto charge_behaviour: {exc}")
+        return False
+
+    # Wait up to 6.0s for EC HB0S / status to settle back from Not charging to Charging.
+    settle_deadline = time.monotonic() + 6.0
+    cur_status = None
+    while time.monotonic() < settle_deadline:
+        cur_status = read_sysfs(bat_path, "status")
+        if cur_status in ("Charging", "Discharging", "Full"):
+            break
+        time.sleep(0.25)
+
+    if cur_status in ("Charging", "Discharging", "Full"):
+        time.sleep(0.25)
+
+    after = get_battery_snapshot(bat_name)
+    log(
+        f"[{bat_name}] EC SMBus pulse (inhibit-charge -> auto): "
+        f"level {before_l} -> {after.get('level_now')}, "
+        f"cap={after.get('capacity')}%, volt {before_v} -> {after.get('voltage_now')} uV, "
+        f"status={after.get('status')}"
+    )
+    return True
+
+
 def rebind_battery_driver(bat_name, cached_driver=None):
-    """Unbind and rebind PNP0C0A:XX so the kernel re-evaluates _STA -> _BIX -> _BTP -> _BST."""
+    """Manually unbind and rebind PNP0C0A:XX when explicitly requested via --rebind."""
     bat_path = os.path.join(POWER_SUPPLY_DIR, bat_name)
     driver_dir, dev_name = resolve_battery_driver(bat_name)
     if (not driver_dir or not dev_name) and cached_driver:
@@ -244,65 +300,22 @@ def rebind_battery_driver(bat_name, cached_driver=None):
             break
         time.sleep(0.1)
 
-    # Touch charge_behaviour and core metrics so EC BCTG/BICG/BDSG (SMI 0x14, 0x05) are queried.
     for attr in ("charge_behaviour", "energy_now", "charge_now", "voltage_now", "power_now", "current_now"):
         read_sysfs(bat_path, attr)
     return os.path.exists(os.path.join(bat_path, "status"))
 
 
 def upower_refresh(bat_name):
-    """Ask upowerd via D-Bus to refresh battery using gdbus, busctl, or dbus-send."""
-    obj_path = f"/org/freedesktop/UPower/devices/battery_{bat_name}"
-    commands = []
-
-    if shutil.which("gdbus"):
-        commands.append(
-            [
-                "gdbus",
-                "call",
-                "--system",
-                "--dest",
-                UPOWER_BUS,
-                "--object-path",
-                obj_path,
-                "--method",
-                f"{UPOWER_IFACE}.Refresh",
-            ]
-        )
-    if shutil.which("busctl"):
-        commands.append(
-            ["busctl", "call", UPOWER_BUS, obj_path, UPOWER_IFACE, "Refresh"]
-        )
-    if shutil.which("dbus-send"):
-        commands.append(
-            [
-                "dbus-send",
-                "--system",
-                "--print-reply",
-                f"--dest={UPOWER_BUS}",
-                obj_path,
-                f"{UPOWER_IFACE}.Refresh",
-            ]
-        )
-
-    if not commands:
+    """Trigger a kernel power_supply change uevent so upowerd re-reads sysfs immediately."""
+    uevent_path = os.path.join(POWER_SUPPLY_DIR, bat_name, "uevent")
+    if not os.path.exists(uevent_path):
         return False
-
-    last_err = None
-    for cmd in commands:
-        try:
-            res = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=5, check=False
-            )
-            if res.returncode == 0:
-                return True
-            last_err = f"{cmd[0]} rc={res.returncode}: {(res.stderr or res.stdout).strip()}"
-        except (OSError, subprocess.SubprocessError) as exc:
-            last_err = f"{cmd[0]} error: {exc}"
-
-    if last_err:
-        log(f"[{bat_name}] Note: UPower Refresh skipped/failed ({last_err})")
-    return False
+    try:
+        write_sysfs(uevent_path, "change\n")
+        return True
+    except OSError as exc:
+        log(f"[{bat_name}] Note: failed writing change to {uevent_path}: {exc}")
+        return False
 
 
 def _run_service_cmd(cmd):
@@ -317,7 +330,7 @@ def _run_service_cmd(cmd):
 
 
 def restart_upower_and_refresh(bat_name):
-    """Restart upowerd (systemd/OpenRC/runit/SysV/D-Bus) to clear 0W latch, then refresh."""
+    """Restart upowerd (systemd/OpenRC/runit/SysV/D-Bus) to clear 0W latch, then emit uevent."""
     log(f"[{bat_name}] Restarting upowerd to reset has_energy_rate_from_hw latch")
     restarted = False
 
@@ -339,7 +352,6 @@ def restart_upower_and_refresh(bat_name):
         )
 
     if not restarted and shutil.which("pkill"):
-        # On systems where D-Bus activates upowerd directly without a service unit:
         _run_service_cmd(["pkill", "-TERM", "-x", "upowerd"])
         restarted = True
 
@@ -347,12 +359,8 @@ def restart_upower_and_refresh(bat_name):
         log(f"[{bat_name}] Warning: could not restart upowerd automatically")
         return False
 
-    time.sleep(0.5)
-    for _ in range(6):
-        if upower_refresh(bat_name):
-            return True
-        time.sleep(0.5)
-    return False
+    time.sleep(0.6)
+    return upower_refresh(bat_name)
 
 
 def cmd_status(args):
@@ -411,7 +419,7 @@ def cmd_status(args):
 
 
 def cmd_recover(args):
-    """Execute one-shot hot recovery (_BTP kick, optional/needed rebind, UPower reset)."""
+    """Execute one-shot hot recovery (_BTP kick, EC SMBus pulse, optional --rebind, UPower refresh)."""
     if os.geteuid() != 0:
         log("Error: 'recover' requires root privileges (use sudo or pkexec).")
         return 1
@@ -430,12 +438,12 @@ def cmd_recover(args):
 
         if snap.get("present"):
             kick_btp(snap)
+            pulse_ec_smbus_refresh(snap)
+            snap = get_battery_snapshot(bat_name)
 
-        if args.rebind or initial_latch:
+        if args.rebind:
             rebind_battery_driver(bat_name)
             snap = get_battery_snapshot(bat_name)
-        else:
-            read_sysfs(snap["path"], "charge_behaviour")
 
         if (initial_latch or is_zero_power_latch(snap) or args.rebind) and not restarted_upower:
             restart_upower_and_refresh(bat_name)
@@ -461,20 +469,19 @@ def _init_battery_state(bat_name):
         "zero_power_streak": 0,
         "not_charging_streak": 0,
         "episode_recovered": False,
+        "pending_upower_sync": False,
         "last_streak_time": 0.0,
+        "last_not_charging_time": 0.0,
+        "last_pulse_time": 0.0,
         "last_stage1_time": -STAGE1_COOLDOWN,
         "last_stage2_time": 0.0,
-        "last_bix_refresh_time": 0.0,
-        "last_level": None,
-        "last_voltage": None,
-        "last_change_time": time.monotonic(),
     }
 
 
 def _process_battery_tick(bat_name, state, now):
     snap = get_battery_snapshot(bat_name)
     if not snap.get("present"):
-        return
+        return False
 
     resolved = resolve_battery_driver(bat_name)
     if resolved[0] and resolved[1]:
@@ -482,13 +489,13 @@ def _process_battery_tick(bat_name, state, now):
 
     status = snap.get("status")
     rate_now = snap.get("rate_now")
-    level_now = snap.get("level_now")
     voltage_now = snap.get("voltage_now")
+    wrote_sysfs = False
 
-    if level_now != state["last_level"] or voltage_now != state["last_voltage"]:
-        state["last_level"] = level_now
-        state["last_voltage"] = voltage_now
-        state["last_change_time"] = now
+    if state["pending_upower_sync"] and status in ("Charging", "Discharging", "Full"):
+        upower_refresh(bat_name)
+        state["pending_upower_sync"] = False
+        wrote_sysfs = True
 
     if is_zero_power_latch(snap):
         state["not_charging_streak"] = 0
@@ -496,53 +503,45 @@ def _process_battery_tick(bat_name, state, now):
             if now - state["last_streak_time"] >= MIN_STREAK_GAP:
                 state["zero_power_streak"] += 1
                 state["last_streak_time"] = now
-                log(
-                    f"[{bat_name}] Detected 0W while {status} (cap={snap.get('capacity')}%, "
-                    f"volt={voltage_now} uV, streak={state['zero_power_streak']}/2)"
-                )
-
-            if state["zero_power_streak"] >= 2 and (
-                now - state["last_stage1_time"] >= STAGE1_COOLDOWN
-            ):
-                log(f"[{bat_name}] Triggering Stage 1 recovery (_BTP + driver rebind + upower restart)")
-                kick_btp(snap)
-                rebind_battery_driver(bat_name, state["cached_driver"])
-                restart_upower_and_refresh(bat_name)
-                now = time.monotonic()
-                state["episode_recovered"] = True
-                state["last_stage1_time"] = now
-                state["last_stage2_time"] = now
-                state["last_bix_refresh_time"] = now
-                state["last_change_time"] = now
-                new_snap = get_battery_snapshot(bat_name)
-                state["last_level"] = new_snap.get("level_now")
-                state["last_voltage"] = new_snap.get("voltage_now")
-        else:
-            if now - state["last_stage2_time"] >= STAGE2_INTERVAL:
-                state["last_stage2_time"] = now
-                kick_btp(snap)
-                post_snap = get_battery_snapshot(bat_name)
-                cur_l = post_snap.get("level_now")
-                cur_v = post_snap.get("voltage_now")
-                if cur_l != state["last_level"] or cur_v != state["last_voltage"]:
-                    state["last_level"] = cur_l
-                    state["last_voltage"] = cur_v
-                    state["last_change_time"] = now
-                elif (now - state["last_change_time"] >= STALL_THRESHOLD) and (
-                    now - state["last_bix_refresh_time"] >= STALL_THRESHOLD
-                ):
+                if state["zero_power_streak"] <= 2:
                     log(
-                        f"[{bat_name}] Stage 2: level & voltage stalled >= 60s; "
-                        "triggering _BIX rebind refresh"
+                        f"[{bat_name}] Detected 0W while {status} (cap={snap.get('capacity')}%, "
+                        f"volt={voltage_now} uV, streak={state['zero_power_streak']}/2)"
                     )
-                    rebind_battery_driver(bat_name, state["cached_driver"])
+
+            if state["zero_power_streak"] >= 2:
+                if now - state["last_stage1_time"] >= STAGE1_COOLDOWN:
+                    log(f"[{bat_name}] Triggering Stage 1 recovery (_BTP + EC SMBus pulse + upower restart)")
+                    kick_btp(snap)
+                    pulsed = pulse_ec_smbus_refresh(snap)
+                    restart_upower_and_refresh(bat_name)
                     now = time.monotonic()
-                    state["last_bix_refresh_time"] = now
-                    state["last_change_time"] = now
-                    refreshed = get_battery_snapshot(bat_name)
-                    state["last_level"] = refreshed.get("level_now")
-                    state["last_voltage"] = refreshed.get("voltage_now")
+                    state["episode_recovered"] = True
+                    state["last_stage1_time"] = now
+                    state["last_stage2_time"] = now
+                    if pulsed:
+                        state["last_pulse_time"] = now
+                    post = get_battery_snapshot(bat_name)
+                    state["pending_upower_sync"] = post.get("status") == "Not charging"
+                    wrote_sysfs = True
+                else:
+                    state["episode_recovered"] = True
+                    state["last_stage2_time"] = now - STAGE2_INTERVAL
+
+        if state["episode_recovered"] and (now - state["last_stage2_time"] >= STAGE2_INTERVAL):
+            kick_btp(snap)
+            pulsed = pulse_ec_smbus_refresh(snap)
+            now = time.monotonic()
+            state["last_stage2_time"] = now
+            if pulsed:
+                state["last_pulse_time"] = now
+            post = get_battery_snapshot(bat_name)
+            if post.get("status") == "Not charging":
+                state["pending_upower_sync"] = True
+            else:
                 upower_refresh(bat_name)
+                state["pending_upower_sync"] = False
+            wrote_sysfs = True
     else:
         if (rate_now is not None and rate_now > 0) or status == "Full":
             if state["episode_recovered"] or state["zero_power_streak"] > 0:
@@ -553,11 +552,18 @@ def _process_battery_tick(bat_name, state, now):
             state["zero_power_streak"] = 0
             state["not_charging_streak"] = 0
             state["episode_recovered"] = False
+            state["pending_upower_sync"] = False
         elif status == "Not charging":
-            state["not_charging_streak"] += 1
-            if state["not_charging_streak"] >= 2:
-                state["zero_power_streak"] = 0
-                state["episode_recovered"] = False
+            if (now - state["last_pulse_time"] >= 10.0) and (
+                now - state["last_not_charging_time"] >= MIN_STREAK_GAP
+            ):
+                state["not_charging_streak"] += 1
+                state["last_not_charging_time"] = now
+                if state["not_charging_streak"] >= 2:
+                    state["zero_power_streak"] = 0
+                    state["episode_recovered"] = False
+
+    return wrote_sysfs
 
 
 def cmd_daemon(args):
@@ -579,8 +585,14 @@ def cmd_daemon(args):
 
     while not _stop_event.is_set():
         now = time.monotonic()
+        any_write = False
         for bat_name, state in states.items():
-            _process_battery_tick(bat_name, state, now)
+            if _process_battery_tick(bat_name, state, now):
+                any_write = True
+
+        if any_write:
+            time.sleep(0.25)
+            _wake_event.clear()
 
         wait_sec = POLL_INTERVAL
         cur_now = time.monotonic()

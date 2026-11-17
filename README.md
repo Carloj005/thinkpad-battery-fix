@@ -45,10 +45,11 @@ Inspection of historical `UPower` telemetry, the ThinkPad ACPI DSDT, the Linux k
 - **Auto-detects batteries & units**: Works with single-battery ThinkPads (`BAT0`) and dual-battery PowerBridge models (`BAT0` + `BAT1`), supporting both `energy_*`/`power_now` (µWh/µW) and `charge_*`/`current_now` (µAh/µA) sysfs interfaces.
 - **Stage 1 recovery** (triggered once per 0 W episode with cooldown):
   1. Kicks ACPI `_BTP` (`AJTP`) via `/sys/class/power_supply/BAT*/alarm`.
-  2. Performs an atomic `unbind`/`bind` on the dynamically resolved kernel battery driver (`/sys/bus/platform/drivers/acpi-battery`, `battery`, or `/sys/bus/acpi/drivers/battery`)—forcing `_STA → _BIX (HIID sweep) → _BTP → _BST` without rebooting.
-  3. Restarts `upowerd` (supporting `systemd`, `OpenRC`, `runit`, `SysVinit`, and D-Bus activation) to clear `has_energy_rate_from_hw`, then triggers `org.freedesktop.UPower.Device.Refresh` via `gdbus`, `busctl`, or `dbus-send`.
+  2. While `Charging` (if `charge_behaviour` exposes `inhibit-charge` and `auto`), performs a brief (~1 s) EC SMBus pulse (`inhibit-charge` → `auto`) to toggle `HB0S` charging state and force the ThinkPad EC to flush cached `SBRC`/`SBVO` registers **without** unbinding `BAT*` from sysfs (preventing panel/widget flicker and preserving UPower history).
+  3. Restarts `upowerd` (supporting `systemd`, `OpenRC`, `runit`, `SysVinit`, and D-Bus activation) to clear `has_energy_rate_from_hw`, then writes `change` to `/sys/class/power_supply/BAT*/uevent` so `upowerd` immediately refreshes from sysfs.
 - **Stage 2 continuous refresh** (while `power_now` / `current_now` remains `0`):
-  - Every 15 s, re-arms `_BTP` (`alarm`) and refreshes `UPower` (and triggers a `_BIX` rebind if both capacity and voltage stall for ≥ 60 s), keeping battery percentage and wattage updating smoothly without unplugging AC or rebooting.
+  - Every **30 s**, re-arms `_BTP` (`alarm`), runs the non-destructive `charge_behaviour` EC SMBus refresh pulse when `Charging`, and triggers a `BAT*/uevent` `change` refresh—keeping battery percentage and `upowerd`'s estimated wattage updating smoothly without unplugging AC, flickering desktop battery widgets, or rebooting.
+  - Note: kernel driver `unbind`/`bind` is never triggered automatically while `BAT*` is present; it remains available manually via `recover --rebind`.
 
 ---
 
@@ -56,29 +57,29 @@ Inspection of historical `UPower` telemetry, the ThinkPad ACPI DSDT, the Linux k
 
 ### Prerequisites
 
-Requires `python3` (standard library only), `upower`, `udev`, and one D-Bus CLI tool (`gdbus`, `busctl`, or `dbus-send`—already installed on virtually all desktops).
+Requires `python3` (standard library only), `upower`, and `udev` (already installed on virtually all Linux desktops).
 
 <details>
 <summary>Optional package install check by distro</summary>
 
 - **Ubuntu / Debian / Mint / Pop!_OS**:
   ```bash
-  sudo apt update && sudo apt install -y python3 upower libglib2.0-bin git
+  sudo apt update && sudo apt install -y python3 upower git
   ```
 - **Fedora / RHEL / Nobara**:
   ```bash
-  sudo dnf install -y python3 upower glib2 git
+  sudo dnf install -y python3 upower git
   ```
 - **Arch Linux / Manjaro / EndeavourOS / Omarchy**:
   ```bash
-  sudo pacman -S --needed python upower glib2 git
+  sudo pacman -S --needed python upower git
   ```
 - **openSUSE Tumbleweed / Leap**:
   ```bash
-  sudo zypper install -y python3 upower glib2-tools git
+  sudo zypper install -y python3 upower git
   ```
 - **Alpine / Void / Gentoo (non-systemd)**:
-  Install `python3`, `upower`, and `glib` (`gdbus`) or `dbus`, then start `/usr/local/bin/thinkpad-battery-fix daemon` from your init supervisor (OpenRC / runit / SysVinit).
+  Install `python3` and `upower`, then start `/usr/local/bin/thinkpad-battery-fix daemon` from your init supervisor (OpenRC / runit / SysVinit).
 
 </details>
 

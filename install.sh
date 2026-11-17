@@ -35,8 +35,9 @@ if [ -z "$DESTDIR" ]; then
 
     if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload
-        systemctl enable --now thinkpad-battery-fix.service
-        echo "Installed and enabled thinkpad-battery-fix.service (systemd)."
+        systemctl enable thinkpad-battery-fix.service
+        systemctl restart thinkpad-battery-fix.service
+        echo "Installed, enabled, and started thinkpad-battery-fix.service (systemd)."
     else
         echo "Installed binary and udev rule to $BINDIR/thinkpad-battery-fix."
         echo "Non-systemd init detected: start '$BINDIR/thinkpad-battery-fix daemon' via your init system (OpenRC/runit/SysVinit)."
