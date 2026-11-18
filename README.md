@@ -2,13 +2,34 @@
 
 > **Universal Linux workaround & recovery daemon for Lenovo ThinkPad batteries that suddenly drop from ~20–30% to 7%, freeze battery percentage updates, and report 0 W on Linux (while working normally on Windows).**
 
-[🇮🇹 Leggi il riepilogo in italiano](#-italiano)
+[![Latest Release](https://img.shields.io/github/v/release/Carloj005/thinkpad-battery-fix)](https://github.com/Carloj005/thinkpad-battery-fix/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+[One-Command Quick Install](#one-command-quick-install) · [How It Works](#how-thinkpad-battery-fix-solves-it) · [🇮🇹 Leggi in italiano](#-italiano)
 
 ---
 
-## Symptoms
+## One-Command Quick Install
 
-On affected ThinkPad models running any Linux distribution (tested on ThinkPad T480s `20L8`, applicable to T480 / T470 / X270 / T580 PowerBridge & similar Lenovo EC platforms):
+Install `thinkpad-battery-fix` (kernel hook module `thinkpad_battery_fix_kmod`, udev rules, and systemd recovery daemon) in one command on Ubuntu, Debian, Arch Linux, Manjaro, Omarchy, Fedora, openSUSE, and other distros:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Carloj005/thinkpad-battery-fix/main/install-remote.sh | sudo bash
+```
+
+---
+
+## Symptoms & Supported Models
+
+If you searched for any of the following issues on Linux:
+- *Lenovo ThinkPad T480s / T480 / X280 / T470 / T580 / A485 battery drops suddenly from ~20% to 7% on Linux*
+- *Battery stuck at 7% and 0 W / 0.00W in `btop`, `upower`, Waybar, or GNOME/KDE/Omarchy power panel*
+- *Laptop says plugged in / charging at `power_now = 0`, battery percentage frozen until AC charger is unplugged*
+- *ThinkPad battery works fine on Windows but locks at 7% / 0 W on Linux*
+
+Then you are hitting the ThinkPad ACPI EC (`SBAC`/`SBRC`/`HIID`/`_BTP`) + `upowerd` latch bug fixed by this project:
+
+On affected ThinkPad models running any Linux distribution (tested on ThinkPad T480s `20L8`, applicable to T480 / T470 / X270 / X280 / T580 / A485 PowerBridge & similar Lenovo EC platforms):
 
 1. Battery discharges normally until around **~20–30%**, then suddenly drops straight to **7%**.
 2. From that moment on, reported wattage (`power_now` / `energy-rate`) stays at **0 W** both on battery and while plugged in.
@@ -88,7 +109,7 @@ Requires `python3` (standard library only), `upower`, `udev`, and kernel headers
 
 </details>
 
-### Quick Install
+### Quick Install (Manual Clone)
 
 ```bash
 git clone https://github.com/Carloj005/thinkpad-battery-fix.git
@@ -96,7 +117,13 @@ cd thinkpad-battery-fix
 sudo ./install.sh
 ```
 
-Or via `make`:
+Or install directly in one step without manually cloning:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Carloj005/thinkpad-battery-fix/main/install-remote.sh | sudo bash
+```
+
+If `linux-headers` (`kernel-devel` on Fedora) and `make` are installed, `install.sh` automatically compiles and loads the `thinkpad_battery_fix_kmod` kernel module (`kmod/dkms.conf` is also included for DKMS setups). Or via `make`:
 
 ```bash
 sudo make install
@@ -154,13 +181,18 @@ While `thinkpad-battery-fix` prevents the 0 W / frozen percentage lockup automat
 
 ## 🇮🇹 Italiano
 
-Fix universale per distribuzioni Linux dedicato al bug dei Lenovo ThinkPad in cui la batteria:
-- scende normalmente fino a circa **20–30%** e poi salta improvvisamente al **7%**;
-- mostra **0 W** sia in carica sia a batteria;
-- rimane congelata al **7%** durante la ricarica finché non si stacca/riattacca fisicamente l'alimentatore o non si riavvia il PC;
-- funziona normalmente su **Windows**.
+Fix universale per distribuzioni Linux dedicato al noto bug dei **Lenovo ThinkPad** (**T480s, T480, X280, T470, T580, A485** e modelli affini) in cui la batteria su Linux:
+- scende normalmente fino a circa **20–30%** e poi salta improvvisamente al **7%** (`batteria ThinkPad Linux scende dal 20% al 7%`);
+- mostra **0 W** (`0.00W` su `btop`, `upower`, pannelli desktop) sia in carica sia a batteria (`ricarica 0W bloccata`);
+- risulta collegata alla corrente ("Plugged" / "Soglia / Mantenimento") rimanendo **congelata al 7%** durante la ricarica finché non si stacca/riattacca fisicamente l'alimentatore o non si riavvia il PC;
+- funziona invece perfettamente su **Windows**.
 
-### Installazione rapida
+### Installazione rapida (un solo comando)
+```bash
+curl -fsSL https://raw.githubusercontent.com/Carloj005/thinkpad-battery-fix/main/install-remote.sh | sudo bash
+```
+
+Oppure tramite clone manuale:
 ```bash
 git clone https://github.com/Carloj005/thinkpad-battery-fix.git
 cd thinkpad-battery-fix
