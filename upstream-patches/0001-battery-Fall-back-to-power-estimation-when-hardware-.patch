@@ -1,0 +1,163 @@
+From e7cf9842384d446a340bf87c29433c13baaba1cf Mon Sep 17 00:00:00 2001
+From: Carlo De Gregorio <carlodegregorio05@gmail.com>
+Date: Thu, 19 Nov 2026 01:26:30 +0100
+Subject: [PATCH] battery: Fall back to power estimation when hardware rate
+ drops to zero
+
+Once a battery reports a non-zero power/current measurement at least once,
+UpDeviceBattery permanently latches priv->trust_power_measurement = TRUE
+and never calls up_device_battery_estimate_power() again for the lifetime
+of the daemon.
+
+On some laptops (such as Lenovo ThinkPad T480s after an EDV2 low-voltage
+trip), the EC/BMS latches the reported current register (SBAC) to 0 while
+the battery continues charging or discharging and energy_now keeps changing.
+Because trust_power_measurement remains latched, energy-rate, time-to-full,
+and time-to-empty stay stuck at 0 until upowerd is restarted.
+
+Track the monotonic timestamp of the last non-zero hardware power reading
+(last_hw_power_measurement) and fall back to up_device_battery_estimate_power()
+when hardware reports <= 0.01 W outside the post-discontinuity distrust window.
+Ignore ring-buffer samples at or before last_hw_power_measurement so a genuine
+transition to 0 W idle never mixes pre-idle energy changes into the estimate.
+Direct hardware readings resume immediately if power_now becomes non-zero again.
+
+Add an integration test covering normal hardware rate, fallback estimation
+after power_now drops to 0, and restoration when hardware recovers.
+
+Signed-off-by: Carlo De Gregorio <carlodegregorio05@gmail.com>
+---
+ src/linux/integration-test.py | 64 +++++++++++++++++++++++++++++++++++
+ src/up-device-battery.c       | 14 ++++++--
+ 2 files changed, 76 insertions(+), 2 deletions(-)
+
+diff --git a/src/linux/integration-test.py b/src/linux/integration-test.py
+index 815fd49..cf7b808 100755
+--- a/src/linux/integration-test.py
++++ b/src/linux/integration-test.py
+@@ -3109,6 +3109,70 @@ class Tests(dbusmock.DBusTestCase):
+         self.assertAlmostEqual(self.get_dbus_dev_property(bat0_up, "EnergyRate"), 0.0)
+         self.stop_daemon()
+ 
++    def test_battery_zero_power_rate_fallback(self):
++        """Fall back to dE/dt rate estimation if hardware power_now drops to 0"""
++
++        energy_now = 10000000
++        self.testbed.add_device(
++            "power_supply", "AC", None, ["type", "Mains", "online", "1"], []
++        )
++        bat0 = self.testbed.add_device(
++            "power_supply",
++            "BAT0",
++            None,
++            [
++                "type",
++                "Battery",
++                "present",
++                "1",
++                "status",
++                "Charging",
++                "energy_full",
++                "50000000",
++                "energy_full_design",
++                "53000000",
++                "energy_now",
++                str(energy_now),
++                "voltage_now",
++                "11400000",
++                "power_now",
++                "16000000",
++            ],
++            [],
++        )
++
++        self.start_daemon()
++        devs = self.proxy.EnumerateDevices()
++        bat0_up = [d for d in devs if d.endswith("battery_BAT0")][0]
++
++        # Hardware rate > 0 latches trust_power_measurement = TRUE
++        self.assertAlmostEqual(
++            self.get_dbus_dev_property(bat0_up, "EnergyRate"), 16.0, places=1
++        )
++
++        # Simulate EC/BMS latching power_now to 0 while charging continues
++        self.testbed.set_attribute(bat0, "power_now", "0")
++        self.testbed.uevent(bat0, "change")
++        for _ in range(25):
++            time.sleep(1)
++            # 18W charge over 1 second
++            energy_now += 18.0 * 1000000 / 3600
++            self.testbed.set_attribute(bat0, "energy_now", str(int(energy_now)))
++
++        rate = self.get_dbus_dev_property(bat0_up, "EnergyRate")
++        self.assertGreater(rate, 10.0)
++        self.assertLess(rate, 25.0)
++        self.assertGreater(self.get_dbus_dev_property(bat0_up, "TimeToFull"), 0)
++
++        # Hardware recovery restores direct power_now reporting
++        self.testbed.set_attribute(bat0, "power_now", "15000000")
++        self.testbed.uevent(bat0, "change")
++        self.assertEventually(
++            lambda: self.get_dbus_dev_property(bat0_up, "EnergyRate"),
++            value=15.0,
++        )
++        self.stop_daemon()
++
+     def test_ups_no_ac(self):
+         """UPS properties without AC"""
+ 
+diff --git a/src/up-device-battery.c b/src/up-device-battery.c
+index 5401026..e04843f 100644
+--- a/src/up-device-battery.c
++++ b/src/up-device-battery.c
+@@ -47,6 +47,7 @@ typedef struct {
+ 	gint charge_cycles;
+ 
+ 	gboolean trust_power_measurement;
++	gint64 last_hw_power_measurement;
+ 	gint64 last_power_discontinuity;
+ 
+ 	/* dynamic values */
+@@ -122,6 +123,10 @@ up_device_battery_estimate_power (UpDeviceBattery *self, UpBatteryValues *cur)
+ 		if (priv->hw_data[pos].state != reported_state)
+ 			break;
+ 
++		/* Do not span across samples where hardware reported power. */
++		if (priv->hw_data[pos].ts_us <= priv->last_hw_power_measurement)
++			break;
++
+ 		td = cur->ts_us - priv->hw_data[pos].ts_us;
+ 		/* At least 15 seconds worth of data. */
+ 		if (td < 15 * G_USEC_PER_SEC)
+@@ -348,14 +353,18 @@ up_device_battery_report (UpDeviceBattery *self,
+ 		values->energy.rate = -values->energy.rate;
+ 
+ 	/* NOTE: We got a (likely sane) reading.
+-	 * Assume power/current readings are accurate from now on. */
+-	if (values->energy.rate > 0.01)
++	 * Assume power/current readings are accurate while non-zero. */
++	if (values->energy.rate > 0.01) {
+ 		priv->trust_power_measurement = TRUE;
++		priv->last_hw_power_measurement = values->ts_us;
++	}
+ 
+ 	if (priv->trust_power_measurement) {
+ 		/* QUIRK: Do not trust readings after a discontinuity happened */
+ 		if (priv->last_power_discontinuity + UP_DAEMON_DISTRUST_RATE_TIMEOUT * G_USEC_PER_SEC > values->ts_us)
+ 			values->energy.rate = 0.0;
++		else if (values->energy.rate <= 0.01)
++			up_device_battery_estimate_power (self, values);
+ 	} else {
+ 		up_device_battery_estimate_power (self, values);
+ 	}
+@@ -607,6 +616,7 @@ up_device_battery_update_info (UpDeviceBattery *self, UpBatteryInfo *info)
+ 	} else {
+ 		priv->present = FALSE;
+ 		priv->trust_power_measurement = FALSE;
++		priv->last_hw_power_measurement = 0;
+ 		priv->hw_data_len = 0;
+ 		priv->units = UP_BATTERY_UNIT_UNDEFINED;
+ 
+-- 
+2.56.0
+

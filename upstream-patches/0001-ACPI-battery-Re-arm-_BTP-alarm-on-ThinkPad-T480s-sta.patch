@@ -1,0 +1,123 @@
+From de5b7bc7a41fd7b84d5592701d27ec2cbc8d5c74 Mon Sep 17 00:00:00 2001
+From: Carlo De Gregorio <carlodegregorio05@gmail.com>
+Date: Thu, 19 Nov 2026 01:27:36 +0100
+Subject: [PATCH RFC] ACPI: battery: Re-arm _BTP alarm on ThinkPad T480s state
+ transitions
+
+On Lenovo ThinkPad T480s (20L8), the DSDT _BTP method calls Method (AJTP),
+which reads the current remaining capacity (SBRC) and battery status
+(HB0S) from the EC, adjusts the EC trip-point comparator registers
+(HT0L/HT0H) relative to SBRC (clamping to SBRC + 1 while charging and
+SBRC - 1 while discharging), and re-enables the trip-point interrupt bit
+(HAM4 |= 0x10).
+
+Currently, the ACPI battery driver only evaluates _BTP at probe/resume
+time or when userspace explicitly writes to the alarm sysfs attribute.
+After a low-voltage EDV2 drop (~7%) where the BMS latches the current
+register (SBAC) to 0, or across charging/discharging transitions, the
+stale EC trip-point comparator stops generating Notify(BAT0, 0x80)
+updates until AC is replugged or the machine is rebooted.
+
+Add a DMI quirk for Lenovo ThinkPad T480s (20L8) that re-evaluates _BTP
+in acpi_battery_get_state() when the battery state changes or when
+rate_now is 0 during charging/discharging and either rate_now just
+dropped to 0 or capacity_now changed.
+
+Note for RFC reviewers: other ThinkPad models sharing the same EC
+Method (AJTP) DSDT pattern (such as T480s 20L7 and T480) may also
+benefit, or this quirk could be scoped more broadly if preferred.
+
+Signed-off-by: Carlo De Gregorio <carlodegregorio05@gmail.com>
+---
+ drivers/acpi/battery.c | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/drivers/acpi/battery.c b/drivers/acpi/battery.c
+index 1db2362..94a62ee 100644
+--- a/drivers/acpi/battery.c
++++ b/drivers/acpi/battery.c
+@@ -58,6 +58,7 @@ MODULE_LICENSE("GPL");
+ static int battery_bix_broken_package;
+ static int battery_notification_delay_ms;
+ static int battery_ac_is_broken;
++static int battery_rearm_alarm;
+ static unsigned int cache_time = 1000;
+ module_param(cache_time, uint, 0644);
+ MODULE_PARM_DESC(cache_time, "cache time in milliseconds");
+@@ -160,6 +161,7 @@ static int acpi_battery_technology(struct acpi_battery *battery)
+ }
+ 
+ static int acpi_battery_get_state(struct acpi_battery *battery);
++static int acpi_battery_set_alarm(struct acpi_battery *battery);
+ 
+ static bool acpi_battery_is_full(struct acpi_battery *battery)
+ {
+@@ -676,6 +678,8 @@ static int acpi_battery_get_state(struct acpi_battery *battery)
+ 	int result = 0;
+ 	acpi_status status = 0;
+ 	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
++	unsigned long old_update_time;
++	int old_state, old_capacity, old_rate;
+ 
+ 	lockdep_assert_held(&battery->property_lock);
+ 
+@@ -687,6 +691,11 @@ static int acpi_battery_get_state(struct acpi_battery *battery)
+ 			msecs_to_jiffies(cache_time)))
+ 		return 0;
+ 
++	old_update_time = battery->update_time;
++	old_state = battery->state;
++	old_capacity = battery->capacity_now;
++	old_rate = battery->rate_now;
++
+ 	status = acpi_evaluate_object_exclusive(battery->device->handle, "_BST", NULL, &buffer);
+ 	if (ACPI_FAILURE(status)) {
+ 		acpi_handle_info(battery->device->handle,
+@@ -724,6 +733,15 @@ static int acpi_battery_get_state(struct acpi_battery *battery)
+ 	    battery->capacity_now > battery->full_charge_capacity)
+ 		battery->capacity_now = battery->full_charge_capacity;
+ 
++	if (!result && battery_rearm_alarm && old_update_time &&
++	    test_bit(ACPI_BATTERY_ALARM_PRESENT, &battery->flags) &&
++	    (battery->state != old_state ||
++	     (battery->rate_now == 0 &&
++	      (battery->state & (ACPI_BATTERY_STATE_CHARGING |
++				 ACPI_BATTERY_STATE_DISCHARGING)) &&
++	      (old_rate != 0 || battery->capacity_now != old_capacity))))
++		acpi_battery_set_alarm(battery);
++
+ 	return result;
+ }
+ 
+@@ -1351,6 +1369,13 @@ battery_ac_is_broken_quirk(const struct dmi_system_id *d)
+ 	return 0;
+ }
+ 
++static int __init
++battery_rearm_alarm_quirk(const struct dmi_system_id *d)
++{
++	battery_rearm_alarm = 1;
++	return 0;
++}
++
+ static const struct dmi_system_id bat_dmi_table[] __initconst = {
+ 	{
+ 		/* NEC LZ750/LS */
+@@ -1387,6 +1412,14 @@ static const struct dmi_system_id bat_dmi_table[] __initconst = {
+ 			DMI_MATCH(DMI_PRODUCT_NAME, "Surface Go 3"),
+ 		},
+ 	},
++	{
++		/* Lenovo ThinkPad T480s (20L8) */
++		.callback = battery_rearm_alarm_quirk,
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "20L8"),
++		},
++	},
+ 	{},
+ };
+ 
+-- 
+2.56.0
+

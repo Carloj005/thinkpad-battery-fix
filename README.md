@@ -208,6 +208,15 @@ journalctl -u thinkpad-battery-fix.service -n 50 --no-pager
 
 ---
 
+## Upstream Patches (Linux Kernel & UPower)
+
+Standalone upstream-ready patches (without userspace daemon or synthetic telemetry) are published in [`upstream-patches/`](upstream-patches/README.md):
+
+- **UPower (`src/up-device-battery.c`)**: [`0001-battery-Fall-back-to-power-estimation-when-hardware-.patch`](upstream-patches/0001-battery-Fall-back-to-power-estimation-when-hardware-.patch) — falls back to `dE/dt` estimation when hardware `power_now` latches to `0 W`.
+- **Linux Kernel (`drivers/acpi/battery.c`, `[PATCH RFC]`)**: [`0001-ACPI-battery-Re-arm-_BTP-alarm-on-ThinkPad-T480s-sta.patch`](upstream-patches/0001-ACPI-battery-Re-arm-_BTP-alarm-on-ThinkPad-T480s-sta.patch) — re-arms `_BTP` on ThinkPad T480s (`20L8`) state and zero-rate transitions (`checkpatch.pl --strict`: 0 errors, 0 warnings).
+
+---
+
 ## License
 
 [MIT](LICENSE)
